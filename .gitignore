@@ -55,4 +55,9 @@ dkms.conf
 *.dwo
 
 data/*
+pgm_s1/
+alerts_s1/
+*.pgm
+*.png
+*.w
 pgmcd

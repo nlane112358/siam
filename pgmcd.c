@@ -6,7 +6,8 @@
  *   cc -O3 -march=native -Wall -Wextra -Wno-unknown-pragmas pgmcd.c -lm -o pgmcd
  *
  * Usage: 
- *  ./pgmcd -t -w flood.w -n 300 pre.pgm post.pgm
+ *  ./pgmcd -t -w flood.w -n 300 pre1.pgm post1.pgm [pre2.pgm post2.pgm ...]
+ *  paste <(ls *_pre.pgm) <(ls *_post.pgm) | ./pgmcd -t -w flood.w -n 1000 -
  *  ./pgmcd -w flood.w -a 0.35 pre.pgm post.pgm > change_map.pgm || notify_alert   
  */
 
@@ -17,6 +18,7 @@
 #include <string.h> 
 #include <ctype.h> 
 #include <math.h>
+#include <time.h>
 #include <unistd.h>
 
 /* Exit status codes following diff(1) and cmp(1) conventions */
@@ -348,11 +350,13 @@ float infonce_step(SiameseNet *net, SiameseNet *velocity,
         branch_forward(net, patches_t1[i], &cache_t1[i]);
     }
 
-    /* Compute InfoNCE similarity matrix and softmax probabilities */
+    /* Compute symmetric InfoNCE similarity matrix and row/col softmax probabilities */
     float logits[BATCH_N][BATCH_N];
-    float probs[BATCH_N][BATCH_N];
+    float probs_row[BATCH_N][BATCH_N];
+    float probs_col[BATCH_N][BATCH_N];
     float inv_temp = 1.0f / TEMP;
-    float loss = 0.0f;
+    float loss_row = 0.0f;
+    float loss_col = 0.0f;
 
     for (int i = 0; i < BATCH_N; ++i) {
         float max_l = -1e30f;
@@ -366,21 +370,36 @@ float infonce_step(SiameseNet *net, SiameseNet *velocity,
         }
         float sum_exp = 0.0f;
         for (int j = 0; j < BATCH_N; ++j) {
-            probs[i][j] = expf(logits[i][j] - max_l);
-            sum_exp += probs[i][j];
+            probs_row[i][j] = expf(logits[i][j] - max_l);
+            sum_exp += probs_row[i][j];
         }
-        for (int j = 0; j < BATCH_N; ++j) probs[i][j] /= sum_exp;
-        loss += -logf(probs[i][i] + 1e-12f);
+        for (int j = 0; j < BATCH_N; ++j) probs_row[i][j] /= sum_exp;
+        loss_row += -logf(probs_row[i][i] + 1e-12f);
     }
 
-    /* Compute gradients w.r.t. normalised embeddings u_hat and v_hat */
+    for (int j = 0; j < BATCH_N; ++j) {
+        float max_l = -1e30f;
+        for (int i = 0; i < BATCH_N; ++i) {
+            if (logits[i][j] > max_l) max_l = logits[i][j];
+        }
+        float sum_exp = 0.0f;
+        for (int i = 0; i < BATCH_N; ++i) {
+            probs_col[i][j] = expf(logits[i][j] - max_l);
+            sum_exp += probs_col[i][j];
+        }
+        for (int i = 0; i < BATCH_N; ++i) probs_col[i][j] /= sum_exp;
+        loss_col += -logf(probs_col[j][j] + 1e-12f);
+    }
+
+    /* Compute symmetric gradients w.r.t. normalised embeddings u_hat and v_hat */
     float d_u_hat[BATCH_N][EMBED_D] = {{0}};
     float d_v_hat[BATCH_N][EMBED_D] = {{0}};
-    float scale = inv_temp / (float)BATCH_N;
+    float scale = 0.5f * inv_temp / (float)BATCH_N;
 
     for (int i = 0; i < BATCH_N; ++i) {
         for (int j = 0; j < BATCH_N; ++j) {
-            float g = (probs[i][j] - (i == j ? 1.0f : 0.0f)) * scale;
+            float target = (i == j) ? 2.0f : 0.0f;
+            float g = (probs_row[i][j] + probs_col[i][j] - target) * scale;
             for (int d = 0; d < EMBED_D; ++d) {
                 d_u_hat[i][d] += g * cache_t1[j].u_hat[d];
                 d_v_hat[j][d] += g * cache_t0[i].u_hat[d];
@@ -388,12 +407,25 @@ float infonce_step(SiameseNet *net, SiameseNet *velocity,
         }
     }
 
-    /* Accumulate parameter gradients across both twin branches */
+    /* Accumulate parameter gradients across both twin branches in parallel */
     SiameseNet grad; 
     memset(&grad, 0, sizeof(SiameseNet));
-    for (int i = 0; i < BATCH_N; ++i) {
-        branch_backward(net, &grad, &cache_t0[i], d_u_hat[i]);
-        branch_backward(net, &grad, &cache_t1[i], d_v_hat[i]);
+    #pragma omp parallel
+    {
+        SiameseNet local_grad;
+        memset(&local_grad, 0, sizeof(SiameseNet));
+        #pragma omp for nowait
+        for (int i = 0; i < BATCH_N; ++i) {
+            branch_backward(net, &local_grad, &cache_t0[i], d_u_hat[i]);
+            branch_backward(net, &local_grad, &cache_t1[i], d_v_hat[i]);
+        }
+        #pragma omp critical
+        {
+            float *dst = (float *)&grad;
+            const float *src = (const float *)&local_grad;
+            size_t n = sizeof(SiameseNet) / sizeof(float);
+            for (size_t k = 0; k < n; ++k) dst[k] += src[k];
+        }
     }
 
     /* Update shared weights with momentum (0.9) + Decoupled Weight Decay */
@@ -407,12 +439,99 @@ float infonce_step(SiameseNet *net, SiameseNet *velocity,
         w_ptr[k] = w_ptr[k] * (1.0f - lr * weight_decay) - lr * v_ptr[k];
     }
 
-    return loss / (float)BATCH_N;
+    return 0.5f * (loss_row + loss_col) / (float)BATCH_N;
 } 
 
 /* 
- * 4. Patch Extraction, Training & Full-Scene Change Map Inference
+ * 4. Patch Extraction, Multi-Pair Loading, Training & Full-Scene Change Map Inference
  */
+
+typedef struct {
+    PGMImage pre;
+    PGMImage post;
+} ImagePair;
+
+static void pairs_free(ImagePair *pairs, size_t count) {
+    if (!pairs) return;
+    for (size_t i = 0; i < count; ++i) {
+        pgm_free(&pairs[i].pre);
+        pgm_free(&pairs[i].post);
+    }
+    free(pairs);
+}
+
+static int pairs_append(ImagePair **pairs, size_t *count, size_t *cap,
+                        const char *pre_path, const char *post_path) {
+    if (strcmp(pre_path, "-") == 0 && strcmp(post_path, "-") == 0) {
+        fprintf(stderr, "pgmcd: cannot stream both pre and post images from stdin\n");
+        return -1;
+    }
+
+    PGMImage pre = {0}, post = {0};
+    if (pgm_read(pre_path, &pre) != 0 || pgm_read(post_path, &post) != 0) {
+        pgm_free(&pre);
+        pgm_free(&post);
+        return -1;
+    }
+
+    if (pre.width != post.width || pre.height != post.height ||
+        pre.width < PATCH_S || pre.height < PATCH_S) {
+        fprintf(stderr, "pgmcd: dimension mismatch or image smaller than %dx%d (%s, %s)\n",
+                PATCH_S, PATCH_S, pre_path, post_path);
+        pgm_free(&pre);
+        pgm_free(&post);
+        return -1;
+    }
+
+    if (*count == *cap) {
+        size_t new_cap = (*cap == 0) ? 16 : (*cap * 2);
+        ImagePair *grown = realloc(*pairs, new_cap * sizeof(ImagePair));
+        if (!grown) {
+            perror("pgmcd: realloc pairs");
+            pgm_free(&pre);
+            pgm_free(&post);
+            return -1;
+        }
+        *pairs = grown;
+        *cap = new_cap;
+    }
+
+    (*pairs)[*count].pre  = pre;
+    (*pairs)[*count].post = post;
+    (*count)++;
+    return 0;
+}
+
+static int pairs_load_list(const char *list_path, ImagePair **pairs,
+                           size_t *count, size_t *cap) {
+    FILE *fp = (strcmp(list_path, "-") == 0) ? stdin : fopen(list_path, "r");
+    if (!fp) {
+        perror("pgmcd: fopen pair list");
+        return -1;
+    }
+
+    char pre_path[4096], post_path[4096];
+    int rc = 0;
+    while (1) {
+        skip_comments_and_ws(fp);
+        int n1 = fscanf(fp, "%4095s", pre_path);
+        if (n1 == EOF) break;
+        skip_comments_and_ws(fp);
+        int n2 = fscanf(fp, "%4095s", post_path);
+        if (n1 != 1 || n2 != 1) {
+            fprintf(stderr, "pgmcd: pair list %s has an unpaired image path\n", list_path);
+            rc = -1;
+            break;
+        }
+        if (pairs_append(pairs, count, cap, pre_path, post_path) != 0) {
+            rc = -1;
+            break;
+        }
+    }
+
+    if (fp != stdin) fclose(fp);
+    return rc;
+}
 
 static void extract_patch(const PGMImage *img, int y0, int x0, float *out, float gain, float bias) {
     for (int dy = 0; dy < PATCH_S; ++dy) {
@@ -427,18 +546,21 @@ static void extract_patch(const PGMImage *img, int y0, int x0, float *out, float
 
 static void usage(const char *prog) {
     fprintf(stderr,
-        "usage: %s [-tcq] [-w weights] [-o out.pgm] [-n steps] [-l lr]\n"
-        "             [-a tile_thresh] [-f alert_frac] [-s stride] <pre.pgm> <post.pgm>\n"
+        "usage: %s [-tcq] [-w weights] [-o out.pgm] [-L list.txt] [-n steps] [-l lr]\n"
+        "             [-a tile_thresh] [-f alert_frac] [-s stride] [-S seed]\n"
+        "             <pre.pgm> <post.pgm> [pre2.pgm post2.pgm ...]\n"
         "options:\n"
-        "  -t            train mode (default: inference mode)\n"
+        "  -t            train mode (accepts multiple pairs or '-' stdin pair list)\n"
         "  -c            continue/fine-tune from existing weights file\n"
         "  -w <file>     weights file path (default: pgmcd.w)\n"
+        "  -L <file>     read training <pre> <post> path pairs from file ('-' for stdin)\n"
         "  -o <file>     output change map PGM (default: '-' for stdout)\n"
         "  -n <int>      training steps (default: 200)\n"
         "  -l <float>    learning rate (default: 0.01)\n"
         "  -a <float>    tile cosine-distance anomaly threshold [0,1] (default: 0.35)\n"
         "  -f <float>    scene alert fraction threshold [0,1] (default: 0.05)\n"
         "  -s <int>      inference sliding-window stride in pixels (default: 8)\n"
+        "  -S <uint>     random seed (default: time-based)\n"
         "  -q            quiet mode (suppress stderr diagnostics)\n"
         "exit status:\n"
         "   0            normal (or training complete)\n"
@@ -456,22 +578,26 @@ int main(int argc, char **argv) {
     float lr = 0.01f;
     float tile_thresh = 0.35f;
     float alert_frac = 0.05f;
+    unsigned int seed = (unsigned int)time(NULL) ^ (unsigned int)getpid();
     const char *weights_path = "pgmcd.w";
+    const char *list_path = NULL;
     const char *out_path = "-"; /* stdout by default */
 
     int opt;
-    while ((opt = getopt(argc, argv, "tcqw:o:n:l:a:f:s:h")) != -1) {
+    while ((opt = getopt(argc, argv, "tcqw:L:o:n:l:a:f:s:S:h")) != -1) {
         switch (opt) {
             case 't': train_mode = 1; break;
             case 'c': continue_weights = 1; break;
             case 'q': quiet = 1; break;
             case 'w': weights_path = optarg; break;
+            case 'L': list_path = optarg; break;
             case 'o': out_path = optarg; break;
             case 'n': steps = atoi(optarg); break;
             case 'l': lr = strtof(optarg, NULL); break;
             case 'a': tile_thresh = strtof(optarg, NULL); break;
             case 'f': alert_frac = strtof(optarg, NULL); break;
             case 's': stride = atoi(optarg); break;
+            case 'S': seed = (unsigned int)strtoul(optarg, NULL, 10); break;
             case 'h':
                 usage(argv[0]);
                 return EXIT_NORMAL;
@@ -481,51 +607,63 @@ int main(int argc, char **argv) {
         }
     }
 
-    /* Expect exactly two positional arguments: <pre.pgm> <post.pgm> */
-    if (argc - optind != 2) {
-        usage(argv[0]);
-        return EXIT_TROUBLE;
-    }
     if (stride < 1 || steps < 1) {
         fprintf(stderr, "pgmcd: stride (-s) and steps (-n) must be >= 1\n");
         return EXIT_TROUBLE;
     }
 
-    const char *pre_path  = argv[optind];
-    const char *post_path = argv[optind + 1];
+    srand(seed);
 
-    /* Prevent reading both inputs from stdin simultaneously */
-    if (strcmp(pre_path, "-") == 0 && strcmp(post_path, "-") == 0) {
-        fprintf(stderr, "pgmcd: cannot stream both pre and post images from stdin\n");
-        return EXIT_TROUBLE;
-    }
-
-    PGMImage pre = {0}, post = {0};
-    if (pgm_read(pre_path, &pre) != 0 || pgm_read(post_path, &post) != 0) {
-        pgm_free(&pre);
-        pgm_free(&post);
-        return EXIT_TROUBLE;
-    }
-
-    if (pre.width != post.width || pre.height != post.height ||
-        pre.width < PATCH_S || pre.height < PATCH_S) {
-        fprintf(stderr, "pgmcd: dimension mismatch or image smaller than %dx%d\n",
-                PATCH_S, PATCH_S);
-        pgm_free(&pre);
-        pgm_free(&post);
-        return EXIT_TROUBLE;
-    }
-
+    int pos_args = argc - optind;
     SiameseNet net;
     int exit_code = EXIT_NORMAL;
 
     if (train_mode) {
+        ImagePair *pairs = NULL;
+        size_t num_pairs = 0, cap_pairs = 0;
+
+        if (list_path) {
+            if (pairs_load_list(list_path, &pairs, &num_pairs, &cap_pairs) != 0) {
+                pairs_free(pairs, num_pairs);
+                return EXIT_TROUBLE;
+            }
+        }
+
+        if (pos_args == 1 && strcmp(argv[optind], "-") == 0) {
+            if (pairs_load_list("-", &pairs, &num_pairs, &cap_pairs) != 0) {
+                pairs_free(pairs, num_pairs);
+                return EXIT_TROUBLE;
+            }
+        } else if (pos_args > 0) {
+            if (pos_args % 2 != 0) {
+                usage(argv[0]);
+                pairs_free(pairs, num_pairs);
+                return EXIT_TROUBLE;
+            }
+            for (int i = optind; i < argc; i += 2) {
+                if (pairs_append(&pairs, &num_pairs, &cap_pairs, argv[i], argv[i + 1]) != 0) {
+                    pairs_free(pairs, num_pairs);
+                    return EXIT_TROUBLE;
+                }
+            }
+        }
+
+        if (num_pairs == 0) {
+            usage(argv[0]);
+            pairs_free(pairs, num_pairs);
+            return EXIT_TROUBLE;
+        }
+
+        if (!quiet && num_pairs > 1) {
+            fprintf(stderr, "pgmcd: loaded %zu image pairs for training\n", num_pairs);
+        }
+
         if (continue_weights) {
             FILE *wf = fopen(weights_path, "rb");
             if (!wf || fread(&net, sizeof(SiameseNet), 1, wf) != 1) {
                 perror("pgmcd: fread weights (-c)");
                 if (wf) fclose(wf);
-                pgm_free(&pre); pgm_free(&post);
+                pairs_free(pairs, num_pairs);
                 return EXIT_TROUBLE;
             }
             fclose(wf);
@@ -543,17 +681,24 @@ int main(int argc, char **argv) {
 
         if (!c_t0 || !c_t1 || !batch_t0 || !batch_t1) {
             perror("pgmcd: malloc");
+            free(c_t0); free(c_t1); free(batch_t0); free(batch_t1);
+            pairs_free(pairs, num_pairs);
             return EXIT_TROUBLE;
         }
 
         for (int step = 1; step <= steps; ++step) {
             for (int b = 0; b < BATCH_N; ++b) {
-                int y0 = rand() % (pre.height - PATCH_S + 1);
-                int x0 = rand() % (pre.width  - PATCH_S + 1);
-                float gain = 1.0f + rand_uniform(0.15f);
-                float bias = rand_uniform(0.08f);
-                extract_patch(&pre,  y0, x0, batch_t0[b], 1.0f, 0.0f);
-                extract_patch(&post, y0, x0, batch_t1[b], gain, bias);
+                size_t p = (size_t)rand() % num_pairs;
+                const PGMImage *pre_img  = &pairs[p].pre;
+                const PGMImage *post_img = &pairs[p].post;
+                int y0 = rand() % (pre_img->height - PATCH_S + 1);
+                int x0 = rand() % (pre_img->width  - PATCH_S + 1);
+                float gain0 = 1.0f + rand_uniform(0.15f);
+                float bias0 = rand_uniform(0.08f);
+                float gain1 = 1.0f + rand_uniform(0.15f);
+                float bias1 = rand_uniform(0.08f);
+                extract_patch(pre_img,  y0, x0, batch_t0[b], gain0, bias0);
+                extract_patch(post_img, y0, x0, batch_t1[b], gain1, bias1);
             }
             float loss = infonce_step(&net, &velocity, c_t0, c_t1,
                                       batch_t0, batch_t1, lr, 1e-4f);
@@ -572,13 +717,29 @@ int main(int argc, char **argv) {
         }
 
         free(c_t0); free(c_t1); free(batch_t0); free(batch_t1);
+        pairs_free(pairs, num_pairs);
     } else {
-        /* Default mode: Inference (streams binary P5 PGM to stdout unless -o set) */
+        /* Default mode: Inference (expects exactly <pre.pgm> <post.pgm>) */
+        if (list_path || pos_args != 2) {
+            usage(argv[0]);
+            return EXIT_TROUBLE;
+        }
+
+        ImagePair *pair = NULL;
+        size_t num_pairs = 0, cap_pairs = 0;
+        if (pairs_append(&pair, &num_pairs, &cap_pairs, argv[optind], argv[optind + 1]) != 0) {
+            pairs_free(pair, num_pairs);
+            return EXIT_TROUBLE;
+        }
+
+        const PGMImage pre  = pair[0].pre;
+        const PGMImage post = pair[0].post;
+
         FILE *wf = fopen(weights_path, "rb");
         if (!wf || fread(&net, sizeof(SiameseNet), 1, wf) != 1) {
             perror("pgmcd: fread weights");
             if (wf) fclose(wf);
-            pgm_free(&pre); pgm_free(&post);
+            pairs_free(pair, num_pairs);
             return EXIT_TROUBLE;
         }
         fclose(wf);
@@ -588,7 +749,7 @@ int main(int argc, char **argv) {
         float *change_map = calloc((size_t)grid_h * grid_w, sizeof(float));
         if (!change_map) {
             perror("pgmcd: calloc");
-            pgm_free(&pre); pgm_free(&post);
+            pairs_free(pair, num_pairs);
             return EXIT_TROUBLE;
         }
 
@@ -614,7 +775,7 @@ int main(int argc, char **argv) {
 
         if (pgm_write(out_path, change_map, grid_w, grid_h) != 0) {
             free(change_map);
-            pgm_free(&pre); pgm_free(&post);
+            pairs_free(pair, num_pairs);
             return EXIT_TROUBLE;
         }
 
@@ -628,10 +789,9 @@ int main(int argc, char **argv) {
         }
 
         free(change_map);
+        pairs_free(pair, num_pairs);
         exit_code = is_alert ? EXIT_ALERT : EXIT_NORMAL;
     }
 
-    pgm_free(&pre);
-    pgm_free(&post);
     return exit_code;
 }
