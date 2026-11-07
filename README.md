@@ -5,56 +5,14 @@ Zero-dependency C11 Siamese Contrastive (Symmetric InfoNCE / Cosine Distance) en
 ## Build
 
 ```sh
-make
+make          # single-threaded
+make OMP=1    # multi-threaded (OpenMP)
 ```
 
-Or compile directly without `make`:
+Or compile directly:
 
 ```sh
-cc -std=c11 -O3 -march=native -Wall -Wextra -Wno-unknown-pragmas -Iinclude src/*.c -lm -o pgmcd
-```
-
-## Architecture & Object Dependency Graph
-
-The codebase is organized into single-word object-oriented C11 modules across `include/` and `src/`:
-
-| Object | Files | Responsibility |
-| :--- | :--- | :--- |
-| **`PGMImage`** | `include/image.h`, `src/image.c` | Netpbm PGM (`P5`/`P2`, 8-bit & 16-bit) I/O and zero-centered patch extraction |
-| **`SiameseNet`** | `include/network.h`, `src/network.c` | Siamese CNN parameters, `BranchCache` activations, forward/backward passes, and weight serialization |
-| **`PairDataset`** | `include/dataset.h`, `src/dataset.c` | Multi-pair `<pre.pgm> <post.pgm>` loading (CLI/file/stdin) and augmented mini-batch sampling |
-| **`ContrastiveTrainer`** | `include/trainer.h`, `src/trainer.c` | Symmetric InfoNCE contrastive loss, SGD with momentum + weight decay, and cosine LR schedule |
-| **`ChangeDetector`** | `include/detector.h`, `src/detector.c` | Sliding-window cosine-distance change-map inference and Mann-Whitney U tile ROC-AUC evaluation |
-| **CLI Dispatcher** | `src/main.c` | POSIX `getopt` parsing and `diff(1)`/`cmp(1)` exit status dispatch |
-
-```text
-                    +------------------------------+
-                    |         main.c (CLI)         |
-                    +--------------+---------------+
-                                   |
-               +-------------------+-------------------+
-               |                                       |
-               v                                       v
-+--------------+---------------+        +--------------+---------------+
-|      ContrastiveTrainer      |        |        ChangeDetector        |
-|   (trainer.h / trainer.c)    |        |   (detector.h / detector.c)  |
-+------+---------------+-------+        +------+-------+-------------+-+
-       |               |                       |       |             |
-       |               +-----------------------+---+   |             |
-       |                                       |   |   |             |
-       |           +---------------------------+   |   |             |
-       |           |                               |   |             |
-       v           v                               v   v             |
-+------+-----------+-----------+        +----------+---+---------+   |
-|          SiameseNet          |        |      PairDataset       |   |
-|   (network.h / network.c)    |        | (dataset.h / dataset.c)|   |
-+------------------------------+        +--------------+---------+   |
-                                                       |             |
-                                                       v             v
-                                        +--------------+-------------+-+
-                                        |           PGMImage           |
-                                        |     (image.h / image.c)      |
-                                        +------------------------------+
+cc -O3 -march=native -Wall -Wextra -Wno-unknown-pragmas pgmcd.c -lm -o pgmcd
 ```
 
 ## Usage
@@ -65,7 +23,7 @@ Train across multiple `<pre.pgm> <post.pgm>` pairs via positional arguments, `-L
 ```sh
 paste <(find pgm_floods -name '*_pre.pgm' | sort | head -n 300) \
       <(find pgm_floods -name '*_post.pgm' | sort | head -n 300) \
-  | ./pgmcd -t -w flood.w -n 10000 -
+  | ./pgmcd -t -w flood.w -n 100000 -
 ```
 
 ### 2. Evaluate (`-e`)
@@ -79,10 +37,10 @@ paste <(find pgm_floods -name '*_pre.pgm' | sort | tail -n 103) \
 
 ```text
 pgmcd: evaluated 103 pairs (383263 tiles, stride=8, thresh=0.35)
-  matched    (pre_i, post_i): mean=0.1039 med=0.0896 p95=0.2348 alerts=0/103 (0.0%)
-  mismatched (pre_i, post_j): mean=0.3452 med=0.3433 p95=0.5269 alerts=103/103 (100.0%)
-  separation gap:             +0.2413
-  tile ROC-AUC:               0.9692
+  matched    (pre_i, post_i): mean=0.1268 med=0.1156 p95=0.2554 alerts=1/103 (1.0%)
+  mismatched (pre_i, post_j): mean=0.4045 med=0.4048 p95=0.5860 alerts=103/103 (100.0%)
+  separation gap:             +0.2777
+  tile ROC-AUC:               0.9811
 ```
 
 ### 3. Inference & Alerting
@@ -96,7 +54,7 @@ Follows POSIX `diff(1)` / `cmp(1)` exit conventions (`0` = normal, `1` = anomaly
 
 ## Sen1Floods11 ($512\times512$) Ground-Truth Flood Comparisons
 
-Trained for 10,000 steps (`flood.w`) without labels on 300 Sentinel-1 SAR pairs (`0.9692` Matched-vs-Mismatched Tile ROC-AUC across 383,263 held-out tiles). Each 4-panel figure shows:
+Trained for 100,000 steps (`flood.w`) without labels on 300 Sentinel-1 SAR pairs (`0.9811` Matched-vs-Mismatched Tile ROC-AUC across 383,263 held-out tiles). Each 4-panel figure shows:
 1. **Panel 1:** Pre-Flood Sentinel-1 SAR ($512\times512$)
 2. **Panel 2:** Post-Flood Sentinel-1 SAR ($512\times512$)
 3. **Panel 3:** Hand-Labeled Ground-Truth Flood Mask (**dark blue** = permanent ocean/river water, **bright cyan** = newly flooded land)
@@ -126,56 +84,3 @@ Trained for 10,000 steps (`flood.w`) without labels on 300 Sentinel-1 SAR pairs 
 ### `Sri-Lanka_713926`
 ![Sri-Lanka_713926](docs/Sri-Lanka_713926_panel4.png)
 
----
-
-## xBD-S12 ($128\times128$) Held-Out Sentinel-1 SAR Alert Examples
-
-Trained for 10,000 steps (`s1_b2.w`, `0.8833` Tile ROC-AUC). Each 3-panel figure shows **Pre-Disaster Sentinel-1 SAR** (left, false-color `VV`/`VH`/`VV−VH`), **Post-Disaster Sentinel-1 SAR** (center), and the **$13\times13$ `pgmcd` Cosine-Distance Change Map** (right, with anomalous tiles $\ge 0.35$ highlighted in red/orange):
-
-### `hurricane-matthew_00000003`
-![hurricane-matthew_00000003](docs/hurricane-matthew_00000003_panel.png)
-
-### `hurricane-matthew_00000009`
-![hurricane-matthew_00000009](docs/hurricane-matthew_00000009_panel.png)
-
-### `hurricane-matthew_00000026`
-![hurricane-matthew_00000026](docs/hurricane-matthew_00000026_panel.png)
-
-### `hurricane-matthew_00000033`
-![hurricane-matthew_00000033](docs/hurricane-matthew_00000033_panel.png)
-
-### `hurricane-matthew_00000036`
-![hurricane-matthew_00000036](docs/hurricane-matthew_00000036_panel.png)
-
-### `hurricane-matthew_00000040`
-![hurricane-matthew_00000040](docs/hurricane-matthew_00000040_panel.png)
-
-### `hurricane-matthew_00000094`
-![hurricane-matthew_00000094](docs/hurricane-matthew_00000094_panel.png)
-
-### `hurricane-matthew_00000099`
-![hurricane-matthew_00000099](docs/hurricane-matthew_00000099_panel.png)
-
-### `hurricane-matthew_00000304`
-![hurricane-matthew_00000304](docs/hurricane-matthew_00000304_panel.png)
-
-### `hurricane-matthew_00000308`
-![hurricane-matthew_00000308](docs/hurricane-matthew_00000308_panel.png)
-
-### `hurricane-matthew_00000350`
-![hurricane-matthew_00000350](docs/hurricane-matthew_00000350_panel.png)
-
-### `hurricane-matthew_00000356`
-![hurricane-matthew_00000356](docs/hurricane-matthew_00000356_panel.png)
-
-### `hurricane-matthew_00000362`
-![hurricane-matthew_00000362](docs/hurricane-matthew_00000362_panel.png)
-
-### `hurricane-matthew_00000364`
-![hurricane-matthew_00000364](docs/hurricane-matthew_00000364_panel.png)
-
-### `hurricane-matthew_00000365`
-![hurricane-matthew_00000365](docs/hurricane-matthew_00000365_panel.png)
-
-### `hurricane-matthew_00000370`
-![hurricane-matthew_00000370](docs/hurricane-matthew_00000370_panel.png)

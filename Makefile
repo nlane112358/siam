@@ -1,20 +1,29 @@
 CC      ?= cc
-CFLAGS  ?= -std=c11 -O3 -march=native -Wall -Wextra -Wno-unknown-pragmas -Iinclude
+CFLAGS  ?= -std=c11 -O3 -march=native -Wall -Wextra
 LDFLAGS ?= -lm
 
-SRCS    := src/image.c src/network.c src/dataset.c src/trainer.c src/detector.c src/main.c
-OBJS    := $(SRCS:.c=.o)
-TARGET  := pgmcd
+ifeq ($(OMP),1)
+  UNAME_S := $(shell uname -s)
+  ifeq ($(UNAME_S),Darwin)
+    OMP_PREFIX ?= $(shell brew --prefix libomp 2>/dev/null || echo /opt/homebrew/opt/libomp)
+    CFLAGS  += -Xpreprocessor -fopenmp -I$(OMP_PREFIX)/include
+    LDFLAGS += -L$(OMP_PREFIX)/lib -lomp
+  else
+    CFLAGS  += -fopenmp
+    LDFLAGS += -fopenmp
+  endif
+else
+  CFLAGS += -Wno-unknown-pragmas
+endif
+
+TARGET = pgmcd
 
 .PHONY: all clean
 
 all: $(TARGET)
 
-$(TARGET): $(OBJS)
-	$(CC) $(CFLAGS) $(OBJS) -o $@ $(LDFLAGS)
-
-src/%.o: src/%.c
-	$(CC) $(CFLAGS) -c $< -o $@
+$(TARGET): pgmcd.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 clean:
-	rm -f $(OBJS) $(TARGET)
+	rm -f $(TARGET)
