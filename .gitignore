@@ -56,7 +56,9 @@ dkms.conf
 
 data/*
 pgm_s1/
+pgm_floods/
 alerts_s1/
+alerts_floods/
 /*.pgm
 /*.png
 /*.w

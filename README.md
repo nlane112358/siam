@@ -5,7 +5,41 @@ Zero-dependency C11 Siamese Contrastive (Symmetric InfoNCE / Cosine Distance) en
 ## Build
 
 ```sh
-cc -O3 -march=native -Wall -Wextra -Wno-unknown-pragmas pgmcd.c -lm -o pgmcd
+make
+```
+
+Or compile directly without `make`:
+
+```sh
+cc -std=c11 -O3 -march=native -Wall -Wextra -Wno-unknown-pragmas -Iinclude src/*.c -lm -o pgmcd
+```
+
+## Architecture & Object Dependency Graph
+
+The codebase is organized into single-word object-oriented C11 modules across `include/` and `src/`:
+
+| Object | Files | Responsibility |
+| :--- | :--- | :--- |
+| **`PGMImage`** | `include/image.h`, `src/image.c` | Netpbm PGM (`P5`/`P2`, 8-bit & 16-bit) I/O and zero-centered patch extraction |
+| **`SiameseNet`** | `include/network.h`, `src/network.c` | Siamese CNN parameters, `BranchCache` activations, forward/backward passes, and weight serialization |
+| **`PairDataset`** | `include/dataset.h`, `src/dataset.c` | Multi-pair `<pre.pgm> <post.pgm>` loading (CLI/file/stdin) and augmented mini-batch sampling |
+| **`ContrastiveTrainer`** | `include/trainer.h`, `src/trainer.c` | Symmetric InfoNCE contrastive loss, SGD with momentum + weight decay, and cosine LR schedule |
+| **`ChangeDetector`** | `include/detector.h`, `src/detector.c` | Sliding-window cosine-distance change-map inference and Mann-Whitney U tile ROC-AUC evaluation |
+| **CLI Dispatcher** | `src/main.c` | POSIX `getopt` parsing and `diff(1)`/`cmp(1)` exit status dispatch |
+
+```mermaid
+flowchart TD
+    Main["main.c (CLI)"] --> Trainer["ContrastiveTrainer (trainer.h / trainer.c)"]
+    Main --> Detector["ChangeDetector (detector.h / detector.c)"]
+    Main --> Dataset["PairDataset (dataset.h / dataset.c)"]
+    Main --> Net["SiameseNet (network.h / network.c)"]
+
+    Trainer --> Net
+    Trainer --> Dataset
+    Detector --> Net
+    Detector --> Dataset
+    Dataset --> Image["PGMImage (image.h / image.c)"]
+    Detector --> Image
 ```
 
 ## Usage
