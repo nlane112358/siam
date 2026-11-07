@@ -5,41 +5,7 @@ Zero-dependency C11 Siamese Contrastive (Symmetric InfoNCE / Cosine Distance) en
 ## Build
 
 ```sh
-make
-```
-
-Or compile directly without `make`:
-
-```sh
-cc -std=c11 -O3 -march=native -Wall -Wextra -Wno-unknown-pragmas -Iinclude src/*.c -lm -o pgmcd
-```
-
-## Architecture & Object Dependency Graph
-
-The codebase is organized into single-word object-oriented C11 modules across `include/` and `src/`:
-
-| Object | Files | Responsibility |
-| :--- | :--- | :--- |
-| **`PGMImage`** | `include/image.h`, `src/image.c` | Netpbm PGM (`P5`/`P2`, 8-bit & 16-bit) I/O and zero-centered patch extraction |
-| **`SiameseNet`** | `include/network.h`, `src/network.c` | Siamese CNN parameters, `BranchCache` activations, forward/backward passes, and weight serialization |
-| **`PairDataset`** | `include/dataset.h`, `src/dataset.c` | Multi-pair `<pre.pgm> <post.pgm>` loading (CLI/file/stdin) and augmented mini-batch sampling |
-| **`ContrastiveTrainer`** | `include/trainer.h`, `src/trainer.c` | Symmetric InfoNCE contrastive loss, SGD with momentum + weight decay, and cosine LR schedule |
-| **`ChangeDetector`** | `include/detector.h`, `src/detector.c` | Sliding-window cosine-distance change-map inference and Mann-Whitney U tile ROC-AUC evaluation |
-| **CLI Dispatcher** | `src/main.c` | POSIX `getopt` parsing and `diff(1)`/`cmp(1)` exit status dispatch |
-
-```mermaid
-flowchart TD
-    Main["main.c (CLI)"] --> Trainer["ContrastiveTrainer (trainer.h / trainer.c)"]
-    Main --> Detector["ChangeDetector (detector.h / detector.c)"]
-    Main --> Dataset["PairDataset (dataset.h / dataset.c)"]
-    Main --> Net["SiameseNet (network.h / network.c)"]
-
-    Trainer --> Net
-    Trainer --> Dataset
-    Detector --> Net
-    Detector --> Dataset
-    Dataset --> Image["PGMImage (image.h / image.c)"]
-    Detector --> Image
+cc -O3 -march=native -Wall -Wextra -Wno-unknown-pragmas pgmcd.c -lm -o pgmcd
 ```
 
 ## Usage
@@ -48,40 +14,74 @@ flowchart TD
 Train across multiple `<pre.pgm> <post.pgm>` pairs via positional arguments, `-L <list.txt>`, or streamed from `stdin` (`-`):
 
 ```sh
-paste <(find pgm_s1 -name '*_pre.pgm' | sort | head -n 1000) \
-      <(find pgm_s1 -name '*_post.pgm' | sort | head -n 1000) \
-  | ./pgmcd -t -w s1_b2.w -n 10000 -
+paste <(find pgm_floods -name '*_pre.pgm' | sort | head -n 300) \
+      <(find pgm_floods -name '*_post.pgm' | sort | head -n 300) \
+  | ./pgmcd -t -w flood.w -n 10000 -
 ```
 
 ### 2. Evaluate (`-e`)
 Compute label-free Matched vs. Mismatched Tile ROC-AUC across held-out image pairs:
 
 ```sh
-paste <(find pgm_s1 -name '*_pre.pgm' | sort | sed -n '1501,1600p') \
-      <(find pgm_s1 -name '*_post.pgm' | sort | sed -n '1501,1600p') \
-  | ./pgmcd -e -w s1_b2.w -
+paste <(find pgm_floods -name '*_pre.pgm' | sort | tail -n 103) \
+      <(find pgm_floods -name '*_post.pgm' | sort | tail -n 103) \
+  | ./pgmcd -e -w flood.w -
 ```
 
 ```text
-pgmcd: evaluated 100 pairs (16900 tiles, stride=8, thresh=0.35)
-  matched    (pre_i, post_i): mean=0.1166 med=0.1111 p95=0.2126 alerts=0/100 (0.0%)
-  mismatched (pre_i, post_j): mean=0.2178 med=0.2123 p95=0.3360 alerts=20/100 (20.0%)
-  separation gap:             +0.1012
-  tile ROC-AUC:               0.8833
+pgmcd: evaluated 103 pairs (383263 tiles, stride=8, thresh=0.35)
+  matched    (pre_i, post_i): mean=0.1039 med=0.0896 p95=0.2348 alerts=0/103 (0.0%)
+  mismatched (pre_i, post_j): mean=0.3452 med=0.3433 p95=0.5269 alerts=103/103 (100.0%)
+  separation gap:             +0.2413
+  tile ROC-AUC:               0.9692
 ```
 
 ### 3. Inference & Alerting
 Follows POSIX `diff(1)` / `cmp(1)` exit conventions (`0` = normal, `1` = anomaly alert triggered, `2` = error):
 
 ```sh
-./pgmcd -w s1_b2.w -a 0.35 -f 0.05 pre.pgm post.pgm > change_map.pgm || notify_alert
+./pgmcd -w flood.w -a 0.35 -f 0.05 pre.pgm post.pgm > change_map.pgm || notify_alert
 ```
 
 ---
 
-## Held-Out Sentinel-1 SAR Alert Examples
+## Sen1Floods11 ($512\times512$) Ground-Truth Flood Comparisons
 
-Each 3-panel figure shows **Pre-Disaster Sentinel-1 SAR** (left, false-color `VV`/`VH`/`VV−VH`), **Post-Disaster Sentinel-1 SAR** (center), and the **$13\times13$ `pgmcd` Cosine-Distance Change Map** (right, with anomalous tiles $\ge 0.35$ highlighted in red/orange):
+Trained for 10,000 steps (`flood.w`) without labels on 300 Sentinel-1 SAR pairs (`0.9692` Matched-vs-Mismatched Tile ROC-AUC across 383,263 held-out tiles). Each 4-panel figure shows:
+1. **Panel 1:** Pre-Flood Sentinel-1 SAR ($512\times512$)
+2. **Panel 2:** Post-Flood Sentinel-1 SAR ($512\times512$)
+3. **Panel 3:** Hand-Labeled Ground-Truth Flood Mask (**dark blue** = permanent ocean/river water, **bright cyan** = newly flooded land)
+4. **Panel 4:** `pgmcd` $61\times61$ Cosine-Distance Change Map (**red/orange** = detected flood change)
+
+### `Sri-Lanka_916628` (`0.9881` Flood Change ROC-AUC)
+![Sri-Lanka_916628](docs/Sri-Lanka_916628_panel4.png)
+
+### `USA_170264`
+![USA_170264](docs/USA_170264_panel4.png)
+
+### `USA_1068362`
+![USA_1068362](docs/USA_1068362_panel4.png)
+
+### `USA_955053`
+![USA_955053](docs/USA_955053_panel4.png)
+
+### `USA_217598`
+![USA_217598](docs/USA_217598_panel4.png)
+
+### `USA_595451`
+![USA_595451](docs/USA_595451_panel4.png)
+
+### `Sri-Lanka_92824`
+![Sri-Lanka_92824](docs/Sri-Lanka_92824_panel4.png)
+
+### `Sri-Lanka_713926`
+![Sri-Lanka_713926](docs/Sri-Lanka_713926_panel4.png)
+
+---
+
+## xBD-S12 ($128\times128$) Held-Out Sentinel-1 SAR Alert Examples
+
+Trained for 10,000 steps (`s1_b2.w`, `0.8833` Tile ROC-AUC). Each 3-panel figure shows **Pre-Disaster Sentinel-1 SAR** (left, false-color `VV`/`VH`/`VV−VH`), **Post-Disaster Sentinel-1 SAR** (center), and the **$13\times13$ `pgmcd` Cosine-Distance Change Map** (right, with anomalous tiles $\ge 0.35$ highlighted in red/orange):
 
 ### `hurricane-matthew_00000003`
 ![hurricane-matthew_00000003](docs/hurricane-matthew_00000003_panel.png)
