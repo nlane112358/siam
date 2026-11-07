@@ -57,7 +57,7 @@ dkms.conf
 data/*
 pgm_s1/
 alerts_s1/
-*.pgm
-*.png
-*.w
+/*.pgm
+/*.png
+/*.w
 pgmcd

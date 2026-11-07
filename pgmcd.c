@@ -534,26 +534,65 @@ static int pairs_load_list(const char *list_path, ImagePair **pairs,
 }
 
 static void extract_patch(const PGMImage *img, int y0, int x0, float *out, float gain, float bias) {
+    const int n = PATCH_S * PATCH_S;
+    float sum = 0.0f;
     for (int dy = 0; dy < PATCH_S; ++dy) {
         for (int dx = 0; dx < PATCH_S; ++dx) {
             float v = img->pixels[(y0 + dy) * img->width + (x0 + dx)] * gain + bias;
             if (v < 0.0f) v = 0.0f; 
             if (v > 1.0f) v = 1.0f;
             out[dy * PATCH_S + dx] = v;
+            sum += v;
         }
     }
+    /* Per-patch zero-mean contrast normalisation + damped DC offset */
+    float mean = sum / (float)n;
+    float var_sum = 0.0f;
+    for (int i = 0; i < n; ++i) {
+        float d = out[i] - mean;
+        var_sum += d * d;
+    }
+    float inv_std = 1.0f / (sqrtf(var_sum / (float)n) + 0.05f);
+    float dc = 0.25f * (mean - 0.5f);
+    for (int i = 0; i < n; ++i) {
+        out[i] = (out[i] - mean) * inv_std + dc;
+    }
+}
+
+static int cmp_float(const void *a, const void *b) {
+    float fa = *(const float *)a;
+    float fb = *(const float *)b;
+    return (fa > fb) - (fa < fb);
+}
+
+static int pairs_load_all(int argc, char **argv, int optind, const char *list_path,
+                          ImagePair **pairs, size_t *num_pairs, size_t *cap_pairs) {
+    int pos_args = argc - optind;
+    if (list_path) {
+        if (pairs_load_list(list_path, pairs, num_pairs, cap_pairs) != 0) return -1;
+    }
+    if (pos_args == 1 && strcmp(argv[optind], "-") == 0) {
+        if (pairs_load_list("-", pairs, num_pairs, cap_pairs) != 0) return -1;
+    } else if (pos_args > 0) {
+        if (pos_args % 2 != 0) return -1;
+        for (int i = optind; i < argc; i += 2) {
+            if (pairs_append(pairs, num_pairs, cap_pairs, argv[i], argv[i + 1]) != 0) return -1;
+        }
+    }
+    return (*num_pairs > 0) ? 0 : -1;
 }
 
 static void usage(const char *prog) {
     fprintf(stderr,
-        "usage: %s [-tcq] [-w weights] [-o out.pgm] [-L list.txt] [-n steps] [-l lr]\n"
+        "usage: %s [-tecq] [-w weights] [-o out.pgm] [-L list.txt] [-n steps] [-l lr]\n"
         "             [-a tile_thresh] [-f alert_frac] [-s stride] [-S seed]\n"
         "             <pre.pgm> <post.pgm> [pre2.pgm post2.pgm ...]\n"
         "options:\n"
         "  -t            train mode (accepts multiple pairs or '-' stdin pair list)\n"
+        "  -e            evaluate mode: matched vs. mismatched tile ROC-AUC (no labels)\n"
         "  -c            continue/fine-tune from existing weights file\n"
         "  -w <file>     weights file path (default: pgmcd.w)\n"
-        "  -L <file>     read training <pre> <post> path pairs from file ('-' for stdin)\n"
+        "  -L <file>     read <pre> <post> path pairs from file ('-' for stdin)\n"
         "  -o <file>     output change map PGM (default: '-' for stdout)\n"
         "  -n <int>      training steps (default: 200)\n"
         "  -l <float>    learning rate (default: 0.01)\n"
@@ -563,7 +602,7 @@ static void usage(const char *prog) {
         "  -S <uint>     random seed (default: time-based)\n"
         "  -q            quiet mode (suppress stderr diagnostics)\n"
         "exit status:\n"
-        "   0            normal (or training complete)\n"
+        "   0            normal (or training/evaluation complete)\n"
         "   1            disaster anomaly alert triggered\n"
         "   2            trouble (I/O or argument error)\n",
         prog);
@@ -571,6 +610,7 @@ static void usage(const char *prog) {
 
 int main(int argc, char **argv) {
     int train_mode = 0;
+    int eval_mode = 0;
     int continue_weights = 0;
     int quiet = 0;
     int steps = 200;
@@ -584,9 +624,10 @@ int main(int argc, char **argv) {
     const char *out_path = "-"; /* stdout by default */
 
     int opt;
-    while ((opt = getopt(argc, argv, "tcqw:L:o:n:l:a:f:s:S:h")) != -1) {
+    while ((opt = getopt(argc, argv, "tecqw:L:o:n:l:a:f:s:S:h")) != -1) {
         switch (opt) {
             case 't': train_mode = 1; break;
+            case 'e': eval_mode = 1; break;
             case 'c': continue_weights = 1; break;
             case 'q': quiet = 1; break;
             case 'w': weights_path = optarg; break;
@@ -607,6 +648,10 @@ int main(int argc, char **argv) {
         }
     }
 
+    if (train_mode && eval_mode) {
+        fprintf(stderr, "pgmcd: cannot specify both -t (train) and -e (evaluate)\n");
+        return EXIT_TROUBLE;
+    }
     if (stride < 1 || steps < 1) {
         fprintf(stderr, "pgmcd: stride (-s) and steps (-n) must be >= 1\n");
         return EXIT_TROUBLE;
@@ -622,33 +667,7 @@ int main(int argc, char **argv) {
         ImagePair *pairs = NULL;
         size_t num_pairs = 0, cap_pairs = 0;
 
-        if (list_path) {
-            if (pairs_load_list(list_path, &pairs, &num_pairs, &cap_pairs) != 0) {
-                pairs_free(pairs, num_pairs);
-                return EXIT_TROUBLE;
-            }
-        }
-
-        if (pos_args == 1 && strcmp(argv[optind], "-") == 0) {
-            if (pairs_load_list("-", &pairs, &num_pairs, &cap_pairs) != 0) {
-                pairs_free(pairs, num_pairs);
-                return EXIT_TROUBLE;
-            }
-        } else if (pos_args > 0) {
-            if (pos_args % 2 != 0) {
-                usage(argv[0]);
-                pairs_free(pairs, num_pairs);
-                return EXIT_TROUBLE;
-            }
-            for (int i = optind; i < argc; i += 2) {
-                if (pairs_append(&pairs, &num_pairs, &cap_pairs, argv[i], argv[i + 1]) != 0) {
-                    pairs_free(pairs, num_pairs);
-                    return EXIT_TROUBLE;
-                }
-            }
-        }
-
-        if (num_pairs == 0) {
+        if (pairs_load_all(argc, argv, optind, list_path, &pairs, &num_pairs, &cap_pairs) != 0) {
             usage(argv[0]);
             pairs_free(pairs, num_pairs);
             return EXIT_TROUBLE;
@@ -686,7 +705,12 @@ int main(int argc, char **argv) {
             return EXIT_TROUBLE;
         }
 
+        const float pi = 3.14159265358979323846f;
+        float ema_loss = 0.0f;
         for (int step = 1; step <= steps; ++step) {
+            float progress = (steps > 1) ? (float)(step - 1) / (float)(steps - 1) : 0.0f;
+            float cur_lr = lr * (0.05f + 0.95f * 0.5f * (1.0f + cosf(pi * progress)));
+
             for (int b = 0; b < BATCH_N; ++b) {
                 size_t p = (size_t)rand() % num_pairs;
                 const PGMImage *pre_img  = &pairs[p].pre;
@@ -701,9 +725,11 @@ int main(int argc, char **argv) {
                 extract_patch(post_img, y0, x0, batch_t1[b], gain1, bias1);
             }
             float loss = infonce_step(&net, &velocity, c_t0, c_t1,
-                                      batch_t0, batch_t1, lr, 1e-4f);
+                                      batch_t0, batch_t1, cur_lr, 1e-4f);
+            ema_loss = (step == 1) ? loss : (0.95f * ema_loss + 0.05f * loss);
             if (!quiet && (step == 1 || step % 25 == 0 || step == steps)) {
-                fprintf(stderr, "pgmcd: step %4d/%d loss=%.5f\n", step, steps, loss);
+                fprintf(stderr, "pgmcd: step %4d/%d lr=%.5f loss=%.5f ema=%.5f\n",
+                        step, steps, cur_lr, loss, ema_loss);
             }
         }
 
@@ -717,6 +743,139 @@ int main(int argc, char **argv) {
         }
 
         free(c_t0); free(c_t1); free(batch_t0); free(batch_t1);
+        pairs_free(pairs, num_pairs);
+    } else if (eval_mode) {
+        /* Evaluate mode (-e): Matched vs. Mismatched Tile ROC-AUC across >= 2 pairs */
+        ImagePair *pairs = NULL;
+        size_t num_pairs = 0, cap_pairs = 0;
+
+        if (pairs_load_all(argc, argv, optind, list_path, &pairs, &num_pairs, &cap_pairs) != 0 ||
+            num_pairs < 2) {
+            fprintf(stderr, "pgmcd: evaluate mode (-e) requires at least 2 image pairs\n");
+            pairs_free(pairs, num_pairs);
+            return EXIT_TROUBLE;
+        }
+
+        FILE *wf = fopen(weights_path, "rb");
+        if (!wf || fread(&net, sizeof(SiameseNet), 1, wf) != 1) {
+            perror("pgmcd: fread weights (-e)");
+            if (wf) fclose(wf);
+            pairs_free(pairs, num_pairs);
+            return EXIT_TROUBLE;
+        }
+        fclose(wf);
+
+        size_t shift = num_pairs / 2;
+        size_t *pair_offsets = malloc((num_pairs + 1) * sizeof(size_t));
+        if (!pair_offsets) {
+            perror("pgmcd: malloc offsets");
+            pairs_free(pairs, num_pairs);
+            return EXIT_TROUBLE;
+        }
+
+        pair_offsets[0] = 0;
+        for (size_t p = 0; p < num_pairs; ++p) {
+            size_t q = (p + shift) % num_pairs;
+            int h = (pairs[p].pre.height < pairs[q].post.height) ? pairs[p].pre.height : pairs[q].post.height;
+            int w = (pairs[p].pre.width  < pairs[q].post.width)  ? pairs[p].pre.width  : pairs[q].post.width;
+            size_t gh = (size_t)((h - PATCH_S) / stride + 1);
+            size_t gw = (size_t)((w - PATCH_S) / stride + 1);
+            pair_offsets[p + 1] = pair_offsets[p] + gh * gw;
+        }
+
+        size_t total_tiles = pair_offsets[num_pairs];
+        float *same_dists = malloc(total_tiles * sizeof(float));
+        float *diff_dists = malloc(total_tiles * sizeof(float));
+        if (!same_dists || !diff_dists) {
+            perror("pgmcd: malloc eval dists");
+            free(pair_offsets); free(same_dists); free(diff_dists);
+            pairs_free(pairs, num_pairs);
+            return EXIT_TROUBLE;
+        }
+
+        size_t same_alerts = 0, diff_alerts = 0;
+        double same_sum = 0.0, diff_sum = 0.0;
+
+        #pragma omp parallel for reduction(+:same_alerts,diff_alerts,same_sum,diff_sum)
+        for (size_t p = 0; p < num_pairs; ++p) {
+            size_t q = (p + shift) % num_pairs;
+            int h = (pairs[p].pre.height < pairs[q].post.height) ? pairs[p].pre.height : pairs[q].post.height;
+            int w = (pairs[p].pre.width  < pairs[q].post.width)  ? pairs[p].pre.width  : pairs[q].post.width;
+            int gh = (h - PATCH_S) / stride + 1;
+            int gw = (w - PATCH_S) / stride + 1;
+            size_t base_idx = pair_offsets[p];
+            int anom_same = 0, anom_diff = 0;
+
+            for (int gy = 0; gy < gh; ++gy) {
+                for (int gx = 0; gx < gw; ++gx) {
+                    float p_pre[PATCH_S * PATCH_S], p_same[PATCH_S * PATCH_S], p_diff[PATCH_S * PATCH_S];
+                    BranchCache c_pre, c_same, c_diff;
+                    extract_patch(&pairs[p].pre,  gy * stride, gx * stride, p_pre,  1.0f, 0.0f);
+                    extract_patch(&pairs[p].post, gy * stride, gx * stride, p_same, 1.0f, 0.0f);
+                    extract_patch(&pairs[q].post, gy * stride, gx * stride, p_diff, 1.0f, 0.0f);
+
+                    branch_forward(&net, p_pre,  &c_pre);
+                    branch_forward(&net, p_same, &c_same);
+                    branch_forward(&net, p_diff, &c_diff);
+
+                    float sim_same = 0.0f, sim_diff = 0.0f;
+                    for (int d = 0; d < EMBED_D; ++d) {
+                        sim_same += c_pre.u_hat[d] * c_same.u_hat[d];
+                        sim_diff += c_pre.u_hat[d] * c_diff.u_hat[d];
+                    }
+                    float dist_same = 0.5f * (1.0f - sim_same);
+                    float dist_diff = 0.5f * (1.0f - sim_diff);
+
+                    size_t idx = base_idx + (size_t)gy * (size_t)gw + (size_t)gx;
+                    same_dists[idx] = dist_same;
+                    diff_dists[idx] = dist_diff;
+                    same_sum += (double)dist_same;
+                    diff_sum += (double)dist_diff;
+
+                    if (dist_same >= tile_thresh) anom_same++;
+                    if (dist_diff >= tile_thresh) anom_diff++;
+                }
+            }
+
+            float n_tiles = (float)(gh * gw);
+            if ((float)anom_same / n_tiles >= alert_frac) same_alerts++;
+            if ((float)anom_diff / n_tiles >= alert_frac) diff_alerts++;
+        }
+
+        qsort(same_dists, total_tiles, sizeof(float), cmp_float);
+        qsort(diff_dists, total_tiles, sizeof(float), cmp_float);
+
+        /* Exact Mann-Whitney U ROC-AUC via two-pointer scan over sorted arrays */
+        double u_sum = 0.0;
+        size_t p_lt = 0, p_le = 0;
+        for (size_t k = 0; k < total_tiles; ++k) {
+            float d = diff_dists[k];
+            while (p_lt < total_tiles && same_dists[p_lt] < d) p_lt++;
+            if (p_le < p_lt) p_le = p_lt;
+            while (p_le < total_tiles && same_dists[p_le] <= d) p_le++;
+            u_sum += (double)p_lt + 0.5 * (double)(p_le - p_lt);
+        }
+        double roc_auc = u_sum / ((double)total_tiles * (double)total_tiles);
+        double same_mean = same_sum / (double)total_tiles;
+        double diff_mean = diff_sum / (double)total_tiles;
+        float same_med = same_dists[total_tiles / 2];
+        float diff_med = diff_dists[total_tiles / 2];
+        float same_p95 = same_dists[(total_tiles * 95) / 100];
+        float diff_p95 = diff_dists[(total_tiles * 95) / 100];
+
+        printf("pgmcd: evaluated %zu pairs (%zu tiles, stride=%d, thresh=%.2f)\n"
+               "  matched    (pre_i, post_i): mean=%.4f med=%.4f p95=%.4f alerts=%zu/%zu (%.1f%%)\n"
+               "  mismatched (pre_i, post_j): mean=%.4f med=%.4f p95=%.4f alerts=%zu/%zu (%.1f%%)\n"
+               "  separation gap:             %+.4f\n"
+               "  tile ROC-AUC:               %.4f\n",
+               num_pairs, total_tiles, stride, tile_thresh,
+               same_mean, same_med, same_p95, same_alerts, num_pairs, 100.0 * (double)same_alerts / (double)num_pairs,
+               diff_mean, diff_med, diff_p95, diff_alerts, num_pairs, 100.0 * (double)diff_alerts / (double)num_pairs,
+               diff_mean - same_mean, roc_auc);
+
+        free(pair_offsets);
+        free(same_dists);
+        free(diff_dists);
         pairs_free(pairs, num_pairs);
     } else {
         /* Default mode: Inference (expects exactly <pre.pgm> <post.pgm>) */
