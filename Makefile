@@ -16,13 +16,13 @@ else
   CFLAGS += -Wno-unknown-pragmas
 endif
 
-TARGET = pgmcd
+TARGET = siam
 
 .PHONY: all clean
 
 all: $(TARGET)
 
-$(TARGET): pgmcd.c
+$(TARGET): siam.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 clean:

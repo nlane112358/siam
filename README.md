@@ -1,4 +1,4 @@
-# pgmcd
+# siam
 
 Zero-dependency C11 Siamese Contrastive (Symmetric InfoNCE / Cosine Distance) engine for self-supervised satellite & SAR image change detection on Netpbm PGM (`P5`/`P2`, 8-bit & 16-bit) imagery.
 
@@ -12,7 +12,7 @@ make OMP=1    # multi-threaded (OpenMP)
 Or compile directly:
 
 ```sh
-cc -O3 -march=native -Wall -Wextra -Wno-unknown-pragmas pgmcd.c -lm -o pgmcd
+cc -O3 -march=native -Wall -Wextra -Wno-unknown-pragmas siam.c -lm -o siam
 ```
 
 ## Usage
@@ -23,7 +23,7 @@ Train across multiple `<pre.pgm> <post.pgm>` pairs via positional arguments, `-L
 ```sh
 paste <(find pgm_floods -name '*_pre.pgm' | sort | head -n 300) \
       <(find pgm_floods -name '*_post.pgm' | sort | head -n 300) \
-  | ./pgmcd -t -w flood.w -n 100000 -
+  | ./siam -t -w flood.w -n 100000 -
 ```
 
 ### 2. Evaluate (`-e`)
@@ -32,11 +32,11 @@ Compute label-free Matched vs. Mismatched Tile ROC-AUC across held-out image pai
 ```sh
 paste <(find pgm_floods -name '*_pre.pgm' | sort | tail -n 103) \
       <(find pgm_floods -name '*_post.pgm' | sort | tail -n 103) \
-  | ./pgmcd -e -w flood.w -
+  | ./siam -e -w flood.w -
 ```
 
 ```text
-pgmcd: evaluated 103 pairs (383263 tiles, stride=8, thresh=0.35)
+siam: evaluated 103 pairs (383263 tiles, stride=8, thresh=0.35)
   matched    (pre_i, post_i): mean=0.1268 med=0.1156 p95=0.2554 alerts=1/103 (1.0%)
   mismatched (pre_i, post_j): mean=0.4045 med=0.4048 p95=0.5860 alerts=103/103 (100.0%)
   separation gap:             +0.2777
@@ -47,7 +47,7 @@ pgmcd: evaluated 103 pairs (383263 tiles, stride=8, thresh=0.35)
 Follows POSIX `diff(1)` / `cmp(1)` exit conventions (`0` = normal, `1` = anomaly alert triggered, `2` = error):
 
 ```sh
-./pgmcd -w flood.w -a 0.35 -f 0.05 pre.pgm post.pgm > change_map.pgm || notify_alert
+./siam -w flood.w -a 0.35 -f 0.05 pre.pgm post.pgm > change_map.pgm || notify_alert
 ```
 
 ---
@@ -58,7 +58,7 @@ Trained for 100,000 steps (`flood.w`) without labels on 300 Sentinel-1 SAR pairs
 1. **Panel 1:** Pre-Flood Sentinel-1 SAR ($512\times512$)
 2. **Panel 2:** Post-Flood Sentinel-1 SAR ($512\times512$)
 3. **Panel 3:** Hand-Labeled Ground-Truth Flood Mask (**dark blue** = permanent ocean/river water, **bright cyan** = newly flooded land)
-4. **Panel 4:** `pgmcd` $61\times61$ Cosine-Distance Change Map (**red/orange** = detected flood change)
+4. **Panel 4:** `siam` $61\times61$ Cosine-Distance Change Map (**red/orange** = detected flood change)
 
 ### `Sri-Lanka_916628` (`0.9881` Flood Change ROC-AUC)
 ![Sri-Lanka_916628](docs/Sri-Lanka_916628_panel4.png)
