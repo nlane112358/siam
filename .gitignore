@@ -63,4 +63,5 @@ alerts_floods/
 /*.png
 /*.w
 siam
-fetch/asf-data/
+fetch/asf-data/*
+!fetch/asf-data/convert_tifs_to_png.py

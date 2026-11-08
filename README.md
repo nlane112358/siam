@@ -96,3 +96,10 @@ Follows POSIX `diff(1)` / `cmp(1)` exit conventions (`0` = normal, `1` = anomaly
 ./siam -w flood.w -a 0.35 -f 0.05 pre.pgm post.pgm > change_map.pgm || notify_alert
 ```
 
+## SAR examples
+
+These exploratory panels show full-scene Sentinel-1 inputs and model distance maps, plus training and held-out chips. The full-scene pass uses stride 16; change maps are contrast-stretched for display.
+
+![Full-scene SAR inference](docs/full_scene_panel.png)
+
+![Training and evaluation chips](docs/change_panel.png)
