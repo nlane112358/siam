@@ -148,6 +148,8 @@ computed colors for every tile.
 
 These exploratory panels show full-scene Sentinel-1 inputs and model distance maps, plus training and held-out chips. The full-scene pass uses stride 16; change maps are contrast-stretched for display.
 
+![Full-scene contrast-stretched change map](docs/full_scene_change_scaled.png)
+
 ![Full-scene SAR inference](docs/full_scene_panel.png)
 
 ![Training and evaluation chips](docs/change_panel.png)
