@@ -5,7 +5,11 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
+#include <cmath>
+#include <limits>
+#include <numeric>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -16,31 +20,66 @@ public:
     explicit ChangeDetector(const SiameseEncoder& encoder) : encoder_(encoder) {}
 
     bool infer(const ImagePair& pair, int stride, float tile_thresh, float alert_frac,
-               bool upsample, const std::string& out_path, bool quiet) const {
+               bool upsample, const std::string& out_path,
+               const std::string& drop_path, const std::string& increase_path,
+               const std::string& embedding_map_path, bool quiet) const {
         const PgmImage& pre = pair.pre;
         const PgmImage& post = pair.post;
         const int grid_h = (pre.height() - Config::PATCH_S) / stride + 1;
         const int grid_w = (pre.width() - Config::PATCH_S) / stride + 1;
         const size_t n_tiles = static_cast<size_t>(grid_h) * grid_w;
-        const auto u0 = encoder_.extract_scene_embeddings(pre, pre.height(), pre.width(), stride);
-        const auto u1 = encoder_.extract_scene_embeddings(post, post.height(), post.width(), stride);
+        const bool directional = !drop_path.empty() && !increase_path.empty();
+        const auto u0 = extract_scene_embeddings_in_rows(pre, stride);
+        const auto u1 = extract_scene_embeddings_in_rows(post, stride);
+        if (!embedding_map_path.empty())
+            save_embedding_pca_ppm(embedding_map_path, u1, grid_w, grid_h);
+        const std::vector<float> mean_delta = directional
+            ? mean_backscatter_delta(pre, post, grid_w, grid_h, stride)
+            : std::vector<float>{};
         PgmImage change_map(grid_w, grid_h);
-        int anomalous_tiles = 0;
-        #pragma omp parallel for reduction(+:anomalous_tiles)
+        PgmImage drop_map, increase_map;
+        if (directional) {
+            drop_map = PgmImage(grid_w, grid_h);
+            increase_map = PgmImage(grid_w, grid_h);
+        }
+        int anomalous_tiles = 0, drop_tiles = 0, increase_tiles = 0;
+        #pragma omp parallel for reduction(+:anomalous_tiles,drop_tiles,increase_tiles)
         for (size_t t = 0; t < n_tiles; ++t) {
             float cos_sim = 0.0f;
             for (int d = 0; d < Config::EMBED_D; ++d) cos_sim += u0[t][d] * u1[t][d];
             const float cos_dist = 0.5f * (1.0f - cos_sim);
             change_map.data()[t] = cos_dist;
-            if (cos_dist >= tile_thresh) ++anomalous_tiles;
+            if (cos_dist >= tile_thresh) {
+                ++anomalous_tiles;
+                if (directional && mean_delta[t] < 0.0f) {
+                    drop_map.data()[t] = cos_dist;
+                    ++drop_tiles;
+                } else if (directional && mean_delta[t] > 0.0f) {
+                    increase_map.data()[t] = cos_dist;
+                    ++increase_tiles;
+                }
+            }
         }
         if (upsample) change_map.upsample_bilinear(pre.width(), pre.height(), stride).save(out_path);
         else change_map.save(out_path);
+        if (directional) {
+            if (upsample) {
+                drop_map.upsample_bilinear(pre.width(), pre.height(), stride).save(drop_path);
+                increase_map.upsample_bilinear(pre.width(), pre.height(), stride).save(increase_path);
+            } else {
+                drop_map.save(drop_path);
+                increase_map.save(increase_path);
+            }
+        }
         const float frac = static_cast<float>(anomalous_tiles) / static_cast<float>(n_tiles);
         const bool is_alert = frac >= alert_frac;
-        if (!quiet)
+        if (!quiet) {
             std::fprintf(stderr, "siam: fraction=%.4f (%d/%zu tiles >= %.2f) status=%s\n",
                          frac, anomalous_tiles, n_tiles, tile_thresh, is_alert ? "ALERT" : "NORMAL");
+            if (directional)
+                std::fprintf(stderr, "siam: directional anomalous tiles: drop=%d increase=%d\n",
+                             drop_tiles, increase_tiles);
+        }
         return is_alert;
     }
 
@@ -117,6 +156,242 @@ public:
                     diff_mean - same_mean, roc_auc);
     }
 private:
+    std::vector<Embedding> extract_scene_embeddings_in_rows(const PgmImage& img,
+                                                              int stride) const {
+        const int width = img.width(), height = img.height();
+        const int grid_h = (height - Config::PATCH_S) / stride + 1;
+        const int grid_w = (width - Config::PATCH_S) / stride + 1;
+        if (stride % 4 != 0 || grid_h <= 128)
+            return encoder_.extract_scene_embeddings(img, height, width, stride);
+
+        constexpr int tile_rows_per_chunk = 64;
+        const size_t n_tiles = static_cast<size_t>(grid_h) * grid_w;
+        std::vector<Embedding> embeddings(n_tiles);
+        for (int gy0 = 0; gy0 < grid_h; gy0 += tile_rows_per_chunk) {
+            const int gy1 = std::min(gy0 + tile_rows_per_chunk, grid_h);
+            const int context_gy0 = std::max(0, gy0 - 1);
+            const int context_gy1 = std::min(grid_h, gy1 + 1);
+            const int crop_y0 = context_gy0 * stride;
+            const int crop_h = (context_gy1 - context_gy0 - 1) * stride + Config::PATCH_S;
+
+            PgmImage crop(width, crop_h);
+            const size_t crop_pixels = static_cast<size_t>(crop_h) * width;
+            std::copy_n(img.data() + static_cast<size_t>(crop_y0) * width,
+                        crop_pixels, crop.data());
+            const auto chunk = encoder_.extract_scene_embeddings(crop, crop_h, width, stride);
+            const int chunk_grid_h = (crop_h - Config::PATCH_S) / stride + 1;
+            if (chunk.size() != static_cast<size_t>(chunk_grid_h) * grid_w)
+                throw std::runtime_error("siam: invalid chunked embedding grid");
+
+            const int local_gy0 = gy0 - context_gy0;
+            for (int gy = gy0; gy < gy1; ++gy) {
+                const size_t src = static_cast<size_t>(local_gy0 + gy - gy0) * grid_w;
+                const size_t dst = static_cast<size_t>(gy) * grid_w;
+                std::copy_n(chunk.data() + src, grid_w, embeddings.data() + dst);
+            }
+        }
+        return embeddings;
+    }
+
+    static void save_embedding_pca_ppm(const std::string& path,
+                                       const std::vector<Embedding>& embeddings,
+                                       int width, int height) {
+        constexpr int dims = Config::EMBED_D;
+        using Matrix = std::array<std::array<double, dims>, dims>;
+        using Vector = std::array<double, dims>;
+        const size_t count = static_cast<size_t>(width) * static_cast<size_t>(height);
+        if (width < 1 || height < 1 || embeddings.size() != count)
+            throw std::runtime_error("siam: invalid embedding grid for PCA visualization");
+        if (count > SIZE_MAX / 3)
+            throw std::runtime_error("siam: PCA visualization dimensions overflow");
+
+        Vector mean{};
+        Matrix covariance{};
+        for (const Embedding& embedding : embeddings) {
+            for (int d = 0; d < dims; ++d) {
+                const double value = static_cast<double>(embedding[d]);
+                if (!std::isfinite(value))
+                    throw std::runtime_error("siam: non-finite embedding value in PCA visualization");
+                mean[d] += value;
+                for (int e = d; e < dims; ++e)
+                    covariance[d][e] += value * static_cast<double>(embedding[e]);
+            }
+        }
+
+        const double inv_count = 1.0 / static_cast<double>(count);
+        for (int d = 0; d < dims; ++d) {
+            mean[d] *= inv_count;
+            for (int e = d; e < dims; ++e) {
+                covariance[d][e] = covariance[d][e] * inv_count - mean[d] * mean[e];
+                covariance[e][d] = covariance[d][e];
+            }
+        }
+
+        // Diagonalize the 32x32 covariance matrix with symmetric Jacobi rotations.
+        Matrix eigenvectors{};
+        for (int d = 0; d < dims; ++d) eigenvectors[d][d] = 1.0;
+        for (int sweep = 0; sweep < 100; ++sweep) {
+            double max_off_diagonal = 0.0, diagonal_scale = 0.0;
+            for (int d = 0; d < dims; ++d) {
+                diagonal_scale = std::max(diagonal_scale, std::abs(covariance[d][d]));
+                for (int e = d + 1; e < dims; ++e)
+                    max_off_diagonal = std::max(max_off_diagonal, std::abs(covariance[d][e]));
+            }
+            const double tolerance = std::max(1e-300, diagonal_scale * 1e-13);
+            if (max_off_diagonal <= tolerance) break;
+
+            bool rotated = false;
+            for (int p = 0; p < dims; ++p) {
+                for (int q = p + 1; q < dims; ++q) {
+                    const double apq = covariance[p][q];
+                    if (std::abs(apq) <= tolerance) continue;
+                    const double tau = (covariance[q][q] - covariance[p][p]) / (2.0 * apq);
+                    const double t = (tau >= 0.0 ? 1.0 : -1.0) /
+                                     (std::abs(tau) + std::sqrt(1.0 + tau * tau));
+                    const double c = 1.0 / std::sqrt(1.0 + t * t);
+                    const double s = t * c;
+                    const double app = covariance[p][p], aqq = covariance[q][q];
+                    covariance[p][p] = app - t * apq;
+                    covariance[q][q] = aqq + t * apq;
+                    covariance[p][q] = covariance[q][p] = 0.0;
+                    for (int k = 0; k < dims; ++k) {
+                        if (k != p && k != q) {
+                            const double akp = covariance[k][p], akq = covariance[k][q];
+                            covariance[k][p] = covariance[p][k] = c * akp - s * akq;
+                            covariance[k][q] = covariance[q][k] = s * akp + c * akq;
+                        }
+                        const double vkp = eigenvectors[k][p], vkq = eigenvectors[k][q];
+                        eigenvectors[k][p] = c * vkp - s * vkq;
+                        eigenvectors[k][q] = s * vkp + c * vkq;
+                    }
+                    rotated = true;
+                }
+            }
+            if (!rotated) break;
+        }
+
+        Vector eigenvalues{};
+        std::array<int, dims> order{};
+        std::iota(order.begin(), order.end(), 0);
+        for (int d = 0; d < dims; ++d) eigenvalues[d] = covariance[d][d];
+        std::sort(order.begin(), order.end(), [&eigenvalues](int a, int b) {
+            if (eigenvalues[a] == eigenvalues[b]) return a < b;
+            return eigenvalues[a] > eigenvalues[b];
+        });
+
+        const double largest_eigenvalue = std::max(0.0, eigenvalues[order[0]]);
+        const double zero_variance_cutoff = largest_eigenvalue * 1e-12;
+        std::array<bool, 3> component_enabled{};
+        std::array<Vector, 3> component_vectors{};
+        for (int component = 0; component < 3; ++component) {
+            const int eigen_index = order[component];
+            component_enabled[component] = eigenvalues[eigen_index] > zero_variance_cutoff;
+            int pivot = 0;
+            for (int d = 1; d < dims; ++d) {
+                if (std::abs(eigenvectors[d][eigen_index]) >
+                    std::abs(eigenvectors[pivot][eigen_index])) pivot = d;
+            }
+            const double sign = eigenvectors[pivot][eigen_index] < 0.0 ? -1.0 : 1.0;
+            for (int d = 0; d < dims; ++d)
+                component_vectors[component][d] = eigenvectors[d][eigen_index] * sign;
+        }
+
+        std::vector<std::array<double, 3>> scores(count);
+        std::array<double, 3> minimum{}, maximum{};
+        minimum.fill(std::numeric_limits<double>::infinity());
+        maximum.fill(-std::numeric_limits<double>::infinity());
+        for (size_t t = 0; t < count; ++t) {
+            for (int component = 0; component < 3; ++component) {
+                if (!component_enabled[component]) continue;
+                double score = 0.0;
+                for (int d = 0; d < dims; ++d)
+                    score += (static_cast<double>(embeddings[t][d]) - mean[d]) *
+                             component_vectors[component][d];
+                scores[t][component] = score;
+                minimum[component] = std::min(minimum[component], score);
+                maximum[component] = std::max(maximum[component], score);
+            }
+        }
+
+        std::vector<uint8_t> rgb(count * 3, 0);
+        for (size_t t = 0; t < count; ++t) {
+            for (int component = 0; component < 3; ++component) {
+                const double range = maximum[component] - minimum[component];
+                if (!component_enabled[component] || !(range > 0.0)) continue;
+                const double scaled = 255.0 * (scores[t][component] - minimum[component]) / range;
+                rgb[t * 3 + component] = static_cast<uint8_t>(
+                    std::clamp(static_cast<int>(std::lround(scaled)), 0, 255));
+            }
+        }
+
+        FileHandle fh(path, "wb", stdout);
+        FILE* fp = fh.get();
+        if (std::fprintf(fp, "P6\n%d %d\n255\n", width, height) < 0 ||
+            std::fwrite(rgb.data(), 1, rgb.size(), fp) != rgb.size())
+            throw std::runtime_error("siam: failed writing PCA visualization to " + path);
+    }
+
+    static std::vector<float> mean_backscatter_delta(const PgmImage& pre,
+                                                     const PgmImage& post,
+                                                     int grid_w, int grid_h,
+                                                     int stride) {
+        constexpr int patch = Config::PATCH_S;
+        const int width = pre.width();
+        std::vector<float> means(static_cast<size_t>(grid_w) * grid_h, 0.0f);
+        std::vector<double> vertical_sum(grid_w, 0.0);
+        std::vector<double> ring(static_cast<size_t>(patch) * grid_w, 0.0);
+        std::vector<double> row_sum(grid_w, 0.0);
+
+        // Rolling 32x32 sums keep directional gating O(image pixels) without
+        // allocating a full-scene difference or integral image.
+        for (int y = 0; y < pre.height(); ++y) {
+            const float* pre_row = pre.data() + static_cast<size_t>(y) * width;
+            const float* post_row = post.data() + static_cast<size_t>(y) * width;
+            double window_sum = 0.0;
+            for (int dx = 0; dx < patch; ++dx)
+                window_sum += static_cast<double>(post_row[dx] - pre_row[dx]);
+            row_sum[0] = window_sum;
+
+            for (int gx = 1; gx < grid_w; ++gx) {
+                const int old_x = (gx - 1) * stride;
+                if (stride <= patch) {
+                    for (int dx = 0; dx < stride; ++dx) {
+                        window_sum -= static_cast<double>(post_row[old_x + dx] - pre_row[old_x + dx]);
+                        const int add_x = old_x + patch + dx;
+                        window_sum += static_cast<double>(post_row[add_x] - pre_row[add_x]);
+                    }
+                } else {
+                    window_sum = 0.0;
+                    const int x = gx * stride;
+                    for (int dx = 0; dx < patch; ++dx)
+                        window_sum += static_cast<double>(post_row[x + dx] - pre_row[x + dx]);
+                }
+                row_sum[gx] = window_sum;
+            }
+
+            const int ring_y = y % patch;
+            for (int gx = 0; gx < grid_w; ++gx) {
+                const size_t idx = static_cast<size_t>(ring_y) * grid_w + gx;
+                vertical_sum[gx] += row_sum[gx] - ring[idx];
+                ring[idx] = row_sum[gx];
+            }
+
+            if (y >= patch - 1) {
+                const int top_y = y - patch + 1;
+                if (top_y % stride == 0) {
+                    const int gy = top_y / stride;
+                    if (gy < grid_h) {
+                        const double inv_area = 1.0 / static_cast<double>(patch * patch);
+                        for (int gx = 0; gx < grid_w; ++gx)
+                            means[static_cast<size_t>(gy) * grid_w + gx] =
+                                static_cast<float>(vertical_sum[gx] * inv_area);
+                    }
+                }
+            }
+        }
+        return means;
+    }
+
     const SiameseEncoder& encoder_;
 };
 

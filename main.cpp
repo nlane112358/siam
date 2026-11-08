@@ -47,6 +47,9 @@ static void usage(FILE* out) {
         "    -w FILE         weights file [siam.w]\n"
         "    -L FILE         read image pairs from FILE; '-' means standard input\n"
         "    -o FILE         write the inference map to FILE; '-' means standard output\n"
+        "    -v FILE         write POST tile embeddings as a PCA false-color P6 PPM; '-' means stdout\n"
+        "    -D FILE         write anomalous backscatter-drop tiles to FILE\n"
+        "    -I FILE         write anomalous backscatter-increase tiles to FILE\n"
         "    -n STEPS        training steps [200]\n"
         "    -l RATE         learning rate [0.01]\n"
         "    -S SEED         random seed [time and process ID]\n"
@@ -61,6 +64,8 @@ static void usage(FILE* out) {
         "\n"
         "EXAMPLES\n"
         "    siam -w siam.w -o change.pgm before.pgm after.pgm\n"
+        "    siam -w siam.w -o change.pgm -v embedding.ppm before.pgm after.pgm\n"
+        "    siam -w siam.w -o change.pgm -D drop.pgm -I increase.pgm before.pgm after.pgm\n"
         "    siam -t -w siam.w -n 200 -L train_pairs.txt\n"
         "    siam -e -w siam.w -L heldout_pairs.txt\n");
 }
@@ -72,18 +77,23 @@ int main(int argc, char** argv) {
     int steps = 200, stride = 8;
     float lr = 0.01f, tile_thresh = 0.35f, alert_frac = 0.05f;
     uint32_t seed = static_cast<uint32_t>(std::time(nullptr)) ^ static_cast<uint32_t>(getpid());
-    std::string weights_path = "siam.w", list_path, out_path = "-";
+    std::string weights_path = "siam.w", list_path, out_path = "-", embedding_map_path;
+    std::string drop_path, increase_path;
+    bool embedding_map_requested = false;
     int opt;
-    while ((opt = getopt(argc, argv, "tecquw:L:o:n:l:a:f:s:S:h")) != -1) {
+    while ((opt = getopt(argc, argv, "tecquv:w:L:o:D:I:n:l:a:f:s:S:h")) != -1) {
         switch (opt) {
             case 't': train_mode = true; break;
             case 'e': eval_mode = true; break;
             case 'c': continue_weights = true; break;
             case 'u': upsample = true; break;
             case 'q': quiet = true; break;
+            case 'v': embedding_map_path = optarg; embedding_map_requested = true; break;
             case 'w': weights_path = optarg; break;
             case 'L': list_path = optarg; break;
             case 'o': out_path = optarg; break;
+            case 'D': drop_path = optarg; break;
+            case 'I': increase_path = optarg; break;
             case 'n': steps = std::atoi(optarg); break;
             case 'l': lr = std::strtof(optarg, nullptr); break;
             case 'a': tile_thresh = std::strtof(optarg, nullptr); break;
@@ -94,7 +104,14 @@ int main(int argc, char** argv) {
             default: usage(stderr); return EXIT_TROUBLE;
         }
     }
-    if ((train_mode && eval_mode) || stride < 1 || steps < 1) {
+    const bool directional = !drop_path.empty() || !increase_path.empty();
+    if ((train_mode && eval_mode) || stride < 1 || steps < 1 ||
+        (drop_path.empty() != increase_path.empty()) ||
+        (directional && (train_mode || eval_mode || drop_path == "-" || increase_path == "-")) ||
+        (directional && (drop_path == increase_path || drop_path == out_path || increase_path == out_path)) ||
+        (embedding_map_requested && (embedding_map_path.empty() || train_mode || eval_mode ||
+            embedding_map_path == out_path ||
+            (directional && (embedding_map_path == drop_path || embedding_map_path == increase_path))))) {
         usage(stderr); return EXIT_TROUBLE;
     }
     try {
@@ -126,7 +143,8 @@ int main(int argc, char** argv) {
         encoder.load_weights(weights_path);
         ChangeDetector detector(encoder);
         const bool is_alert = detector.infer(pairs[0], stride, tile_thresh, alert_frac,
-                                             upsample, out_path, quiet);
+                                             upsample, out_path, drop_path, increase_path,
+                                             embedding_map_path, quiet);
         return is_alert ? EXIT_ALERT : EXIT_NORMAL;
     } catch (const std::exception& ex) {
         std::fprintf(stderr, "%s\n", ex.what());

@@ -45,6 +45,9 @@ OPTIONS
     -w FILE         weights file [siam.w]
     -L FILE         read image pairs from FILE; '-' means standard input
     -o FILE         write the inference map to FILE; '-' means standard output
+    -v FILE         write POST tile embeddings as a PCA false-color P6 PPM; '-' means stdout
+    -D FILE         write anomalous backscatter-drop tiles to FILE
+    -I FILE         write anomalous backscatter-increase tiles to FILE
     -n STEPS        training steps [200]
     -l RATE         learning rate [0.01]
     -S SEED         random seed [time and process ID]
@@ -59,6 +62,8 @@ EXIT STATUS
 
 EXAMPLES
     siam -w siam.w -o change.pgm before.pgm after.pgm
+    siam -w siam.w -o change.pgm -v embedding.ppm before.pgm after.pgm
+    siam -w siam.w -o change.pgm -D drop.pgm -I increase.pgm before.pgm after.pgm
     siam -t -w siam.w -n 200 -L train_pairs.txt
     siam -e -w siam.w -L heldout_pairs.txt
 ```
@@ -95,6 +100,49 @@ Follows POSIX `diff(1)` / `cmp(1)` exit conventions (`0` = normal, `1` = anomaly
 ```sh
 ./siam -w flood.w -a 0.35 -f 0.05 pre.pgm post.pgm > change_map.pgm || notify_alert
 ```
+
+To split anomalous tiles by backscatter direction, request both directional maps:
+
+```sh
+./siam -w flood.w -s 16 -a 0.35 \
+  -o change_map.pgm -D backscatter_drop.pgm -I backscatter_increase.pgm \
+  pre.pgm post.pgm
+```
+
+Each 32×32 window is assigned to the drop or increase map when its cosine distance
+meets `-a` and its mean `POST−PRE` pixel difference is negative or positive,
+respectively. The map retains the cosine-distance value for those tiles and zeros
+the rest. `-u` upsamples all three outputs. This is a directional gate: on
+calibrated dB inputs, the sign corresponds to ΔdB; on linear backscatter inputs,
+the sign of each pixel difference corresponds to the sign of its dB change. Use
+the same calibration and intensity scaling for both images. Independently
+stretched or clipped inputs can distort or erase the direction.
+
+The labels describe backscatter decrease and increase, not confirmed flood or
+vegetation classes. A decrease can be consistent with open-water inundation;
+increases can include double-bounce flooding, agriculture, or construction.
+
+To visualize the learned embedding across the POST scene, request a PCA
+false-color image:
+
+```sh
+./siam -w flood.w -o change_map.pgm -v embeddings.ppm pre.pgm post.pgm
+```
+
+`embeddings.ppm` is a binary P6 image with one pixel per inference tile. PCA is
+fit to the POST scene's normalized 32D tile embeddings; the first three
+principal component scores are independently stretched to the red, green, and
+blue channels. The colors show relative embedding variation within that scene,
+so coherent regions may emerge, but colors do not have fixed meanings such as
+water or urban and are not comparable across scenes. The `-u` option only
+upsamples the PGM inference and directional maps.
+
+This full-scene example uses the original 29,531×21,940 Sentinel-1 inputs with
+stride 8 and no input resampling. The displayed PNG masks zero-valued tile
+centers outside the valid data footprint; the P6 output from `siam` retains the
+computed colors for every tile.
+
+![Full-scene Sentinel-1 embedding PCA](docs/full_scene_embedding_pca.png)
 
 ## SAR examples
 
