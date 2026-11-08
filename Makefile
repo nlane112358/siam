@@ -22,7 +22,10 @@ TARGET = siam
 
 all: $(TARGET)
 
-$(TARGET): siam.cpp
+SOURCES = main.cpp
+HEADERS = config.hpp image.hpp network.hpp trainer.hpp detector.hpp dataset.hpp
+
+$(TARGET): $(SOURCES) $(HEADERS)
 	$(CXX) $(CXXFLAGS) $< -o $@ $(LDFLAGS)
 
 clean:

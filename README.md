@@ -12,7 +12,7 @@ make OMP=1    # multi-threaded (OpenMP)
 Or compile directly:
 
 ```sh
-g++ -std=c++17 -O3 -march=native -Wall -Wextra -Wno-unknown-pragmas siam.cpp -lm -o siam
+g++ -std=c++17 -O3 -march=native -Wall -Wextra -Wno-unknown-pragmas main.cpp -lm -o siam
 ```
 
 ## Usage
