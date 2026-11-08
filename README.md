@@ -17,6 +17,52 @@ g++ -std=c++17 -O3 -march=native -Wall -Wextra -Wno-unknown-pragmas main.cpp -lm
 
 ## Usage
 
+The command-line reference is also available with `siam -h`:
+
+```text
+NAME
+    siam - train and run a Siamese image-change detector
+
+SYNOPSIS
+    siam [options] PRE POST
+    siam -t [options] [PRE POST]...
+    siam -e [options] [PRE POST]...
+    siam -h
+
+DESCRIPTION
+    PRE and POST are P2 or P5 PGM images (8-bit or 16-bit) with matching
+    dimensions of at least 32x32 pixels. Training and evaluation accept
+    image pairs as operands, from a pair list (-L FILE), or from standard
+    input (-). Each pair-list entry is PRE POST.
+
+OPTIONS
+    -h              display help and exit
+    -t              train
+    -e              evaluate matched and mismatched pairs (at least 2 pairs)
+    -c              continue training from saved weights
+    -q              suppress training progress and inference status
+    -u              upsample the inference map to input dimensions
+    -w FILE         weights file [siam.w]
+    -L FILE         read image pairs from FILE; '-' means standard input
+    -o FILE         write the inference map to FILE; '-' means standard output
+    -n STEPS        training steps [200]
+    -l RATE         learning rate [0.01]
+    -S SEED         random seed [time and process ID]
+    -a VALUE        tile distance threshold [0.35]
+    -f VALUE        alert fraction threshold [0.05]
+    -s PIXELS       sliding-window stride [8]
+
+EXIT STATUS
+    0   normal result or successful training/evaluation
+    1   anomaly alert
+    2   invalid arguments or I/O/runtime error
+
+EXAMPLES
+    siam -w siam.w -o change.pgm before.pgm after.pgm
+    siam -t -w siam.w -n 200 -L train_pairs.txt
+    siam -e -w siam.w -L heldout_pairs.txt
+```
+
 ### 1. Train (`-t`)
 Train across multiple `<pre.pgm> <post.pgm>` pairs via positional arguments, `-L <list.txt>`, or streamed from `stdin` (`-`):
 

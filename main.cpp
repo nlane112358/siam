@@ -20,11 +20,49 @@
 #include <vector>
 #include <unistd.h>
 
-static void usage(const char* prog) {
-    std::fprintf(stderr,
-        "usage: %s [-tecqu] [-w weights] [-o out.pgm] [-L list.txt] [-n steps] [-l lr]\n"
-        "            [-a tile_thresh] [-f alert_frac] [-s stride] [-S seed]\n"
-        "            <pre.pgm> <post.pgm> [pre2.pgm post2.pgm ...]\n", prog);
+static void usage(FILE* out) {
+    std::fprintf(out,
+        "NAME\n"
+        "    siam - train and run a Siamese image-change detector\n"
+        "\n"
+        "SYNOPSIS\n"
+        "    siam [options] PRE POST\n"
+        "    siam -t [options] [PRE POST]...\n"
+        "    siam -e [options] [PRE POST]...\n"
+        "    siam -h\n"
+        "\n"
+        "DESCRIPTION\n"
+        "    PRE and POST are P2 or P5 PGM images (8-bit or 16-bit) with matching\n"
+        "    dimensions of at least 32x32 pixels. Training and evaluation accept\n"
+        "    image pairs as operands, from a pair list (-L FILE), or from standard\n"
+        "    input (-). Each pair-list entry is PRE POST.\n"
+        "\n"
+        "OPTIONS\n"
+        "    -h              display help and exit\n"
+        "    -t              train\n"
+        "    -e              evaluate matched and mismatched pairs (at least 2 pairs)\n"
+        "    -c              continue training from saved weights\n"
+        "    -q              suppress training progress and inference status\n"
+        "    -u              upsample the inference map to input dimensions\n"
+        "    -w FILE         weights file [siam.w]\n"
+        "    -L FILE         read image pairs from FILE; '-' means standard input\n"
+        "    -o FILE         write the inference map to FILE; '-' means standard output\n"
+        "    -n STEPS        training steps [200]\n"
+        "    -l RATE         learning rate [0.01]\n"
+        "    -S SEED         random seed [time and process ID]\n"
+        "    -a VALUE        tile distance threshold [0.35]\n"
+        "    -f VALUE        alert fraction threshold [0.05]\n"
+        "    -s PIXELS       sliding-window stride [8]\n"
+        "\n"
+        "EXIT STATUS\n"
+        "    0   normal result or successful training/evaluation\n"
+        "    1   anomaly alert\n"
+        "    2   invalid arguments or I/O/runtime error\n"
+        "\n"
+        "EXAMPLES\n"
+        "    siam -w siam.w -o change.pgm before.pgm after.pgm\n"
+        "    siam -t -w siam.w -n 200 -L train_pairs.txt\n"
+        "    siam -e -w siam.w -L heldout_pairs.txt\n");
 }
 
 int main(int argc, char** argv) {
@@ -52,12 +90,12 @@ int main(int argc, char** argv) {
             case 'f': alert_frac = std::strtof(optarg, nullptr); break;
             case 's': stride = std::atoi(optarg); break;
             case 'S': seed = static_cast<uint32_t>(std::strtoul(optarg, nullptr, 10)); break;
-            case 'h': usage(argv[0]); return EXIT_NORMAL;
-            default: usage(argv[0]); return EXIT_TROUBLE;
+            case 'h': usage(stdout); return EXIT_NORMAL;
+            default: usage(stderr); return EXIT_TROUBLE;
         }
     }
     if ((train_mode && eval_mode) || stride < 1 || steps < 1) {
-        usage(argv[0]); return EXIT_TROUBLE;
+        usage(stderr); return EXIT_TROUBLE;
     }
     try {
         SiameseEncoder encoder;
@@ -81,7 +119,7 @@ int main(int argc, char** argv) {
             return EXIT_NORMAL;
         }
         if (!list_path.empty() || (argc - optind) != 2) {
-            usage(argv[0]); return EXIT_TROUBLE;
+            usage(stderr); return EXIT_TROUBLE;
         }
         std::vector<ImagePair> pairs;
         append_pair(pairs, argv[optind], argv[optind + 1]);
