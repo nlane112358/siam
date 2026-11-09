@@ -238,10 +238,12 @@ Use a west,south,east,north bounding box and ISO dates. This search lists matchi
   -orbit=35 -direction=DESCENDING -pol=vv -ls
 ```
 
-For downloads, set either `EARTHDATA_TOKEN` or both `EARTHDATA_USERNAME` and `EARTHDATA_PASSWORD`. Then pipe the TIFF paths printed by `asf` into `sarimg`:
+For downloads, copy `.env.example` to `.env` and set either `EARTHDATA_TOKEN` or both `EARTHDATA_USERNAME` and `EARTHDATA_PASSWORD`. The local `.env` is ignored by Git. `asf` loads it from the current directory or the repository root when using `bin/asf`; existing environment variables take precedence. The workflow scripts also load it through `scripts/config.sh`. Use one `KEY=value` assignment per line, and single-quote values containing shell-special characters such as `$`.
 
 ```sh
-export EARTHDATA_TOKEN="YOUR_EARTHDATA_TOKEN"
+[ -f .env ] || cp .env.example .env
+chmod 600 .env
+# Edit .env and add your Earthdata token or username and password.
 ./bin/asf -bbox="-5.5,49.9,1.8,53.5" -from=2025-05-01 -to=2025-10-01 \
   -orbit=35 -direction=DESCENDING -pol=vv -out=../data/england/tif \
   | ./bin/sarimg -bbox="-5.5,49.9,1.8,53.5" -res=10 \

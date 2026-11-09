@@ -66,6 +66,11 @@ siam
 fetch/asf-data/*
 !fetch/asf-data/convert_tifs_to_png.py
 
+# Local credentials
+/.env
+/.env.*
+!/.env.example
+
 # Generated Sentinel-1 datasets and local Go executables
 /fetch/data_*/
 /fetch/asf

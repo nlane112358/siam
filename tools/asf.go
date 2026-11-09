@@ -84,6 +84,11 @@ func main() {
 	if err != nil {
 		log.Fatalf("scenes: %v", err)
 	}
+	if !*listOnly {
+		if err := loadEarthdataEnv(); err != nil {
+			log.Fatalf("load Earthdata .env: %v", err)
+		}
+	}
 
 	client := earthdataClient(*listOnly)
 	progress.Printf("search: ASF")
@@ -440,6 +445,108 @@ func earthdataClient(listOnly bool) *http.Client {
 		}
 		return nil
 	}}
+}
+
+// loadEarthdataEnv reads a local .env without overriding values already set by
+// the caller. It checks the current directory and, for the repository binary,
+// the repository root next to bin/asf.
+func loadEarthdataEnv() error {
+	candidates := []string{filepath.Join(".", ".env")}
+	if executable, err := os.Executable(); err == nil {
+		executableDir := filepath.Dir(executable)
+		if filepath.Base(executableDir) == "bin" {
+			candidates = append(candidates, filepath.Join(filepath.Dir(executableDir), ".env"))
+		} else {
+			candidates = append(candidates, filepath.Join(executableDir, ".env"))
+		}
+	}
+
+	seen := make(map[string]bool)
+	for _, candidate := range candidates {
+		path, err := filepath.Abs(candidate)
+		if err != nil {
+			return err
+		}
+		if seen[path] {
+			continue
+		}
+		seen[path] = true
+		if err := loadEarthdataEnvFile(path); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
+	return nil
+}
+
+func loadEarthdataEnvFile(path string) error {
+	file, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for lineNumber := 1; scanner.Scan(); lineNumber++ {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		line = strings.TrimSpace(strings.TrimPrefix(line, "export "))
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			return fmt.Errorf("%s:%d: expected KEY=value", path, lineNumber)
+		}
+		key = strings.TrimSpace(key)
+		if key != "EARTHDATA_TOKEN" && key != "EARTHDATA_USERNAME" && key != "EARTHDATA_PASSWORD" {
+			continue
+		}
+		if _, exists := os.LookupEnv(key); exists {
+			continue
+		}
+		value, err := parseEnvValue(strings.TrimSpace(value))
+		if err != nil {
+			return fmt.Errorf("%s:%d: %w", path, lineNumber, err)
+		}
+		if err := os.Setenv(key, value); err != nil {
+			return fmt.Errorf("%s:%d: set %s: %w", path, lineNumber, key, err)
+		}
+	}
+	return scanner.Err()
+}
+
+func parseEnvValue(value string) (string, error) {
+	if value == "" {
+		return "", nil
+	}
+	if value[0] == '\'' || value[0] == '"' {
+		quote := value[0]
+		for i := 1; i < len(value); i++ {
+			if quote == '"' && value[i] == '\\' {
+				i++
+				continue
+			}
+			if value[i] != quote {
+				continue
+			}
+			rest := strings.TrimSpace(value[i+1:])
+			if rest != "" && !strings.HasPrefix(rest, "#") {
+				return "", fmt.Errorf("unexpected text after quoted value")
+			}
+			if quote == '"' {
+				unquoted, err := strconv.Unquote(value[:i+1])
+				if err != nil {
+					return "", fmt.Errorf("invalid quoted value: %w", err)
+				}
+				return unquoted, nil
+			}
+			return value[1:i], nil
+		}
+		return "", fmt.Errorf("unterminated quoted value")
+	}
+	if comment := strings.Index(value, " #"); comment >= 0 {
+		value = strings.TrimSpace(value[:comment])
+	}
+	return value, nil
 }
 
 func auth(r *http.Request) {
