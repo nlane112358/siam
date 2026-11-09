@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cmath>
 #include <ctime>
 #include <exception>
 #include <random>
@@ -53,8 +54,9 @@ static void usage(FILE* out) {
         "    -n STEPS        training steps [200]\n"
         "    -l RATE         learning rate [0.01]\n"
         "    -S SEED         random seed [time and process ID]\n"
-        "    -a VALUE        tile distance threshold [0.35]\n"
-        "    -f VALUE        alert fraction threshold [0.05]\n"
+        "    -p VALUE        image false-alarm probability for inference [1e-6]\n"
+        "    -a VALUE        evaluation cosine-distance threshold [0.35]\n"
+        "    -f VALUE        evaluation alert fraction threshold [0.05]\n"
         "    -s PIXELS       sliding-window stride [8]\n"
         "\n"
         "EXIT STATUS\n"
@@ -76,12 +78,14 @@ int main(int argc, char** argv) {
     bool upsample = false, quiet = false;
     int steps = 200, stride = 8;
     float lr = 0.01f, tile_thresh = 0.35f, alert_frac = 0.05f;
+    double false_alarm_prob = 1e-6;
     uint32_t seed = static_cast<uint32_t>(std::time(nullptr)) ^ static_cast<uint32_t>(getpid());
     std::string weights_path = "siam.w", list_path, out_path = "-", embedding_map_path;
     std::string drop_path, increase_path;
     bool embedding_map_requested = false;
+    bool p_requested = false, p_parse_valid = true, eval_threshold_requested = false;
     int opt;
-    while ((opt = getopt(argc, argv, "tecquv:w:L:o:D:I:n:l:a:f:s:S:h")) != -1) {
+    while ((opt = getopt(argc, argv, "tecquv:w:L:o:D:I:n:l:a:f:p:s:S:h")) != -1) {
         switch (opt) {
             case 't': train_mode = true; break;
             case 'e': eval_mode = true; break;
@@ -96,8 +100,15 @@ int main(int argc, char** argv) {
             case 'I': increase_path = optarg; break;
             case 'n': steps = std::atoi(optarg); break;
             case 'l': lr = std::strtof(optarg, nullptr); break;
-            case 'a': tile_thresh = std::strtof(optarg, nullptr); break;
-            case 'f': alert_frac = std::strtof(optarg, nullptr); break;
+            case 'a': tile_thresh = std::strtof(optarg, nullptr); eval_threshold_requested = true; break;
+            case 'f': alert_frac = std::strtof(optarg, nullptr); eval_threshold_requested = true; break;
+            case 'p': {
+                char* end = nullptr;
+                false_alarm_prob = std::strtod(optarg, &end);
+                p_parse_valid = end != optarg && *end == '\0';
+                p_requested = true;
+                break;
+            }
             case 's': stride = std::atoi(optarg); break;
             case 'S': seed = static_cast<uint32_t>(std::strtoul(optarg, nullptr, 10)); break;
             case 'h': usage(stdout); return EXIT_NORMAL;
@@ -106,6 +117,10 @@ int main(int argc, char** argv) {
     }
     const bool directional = !drop_path.empty() || !increase_path.empty();
     if ((train_mode && eval_mode) || stride < 1 || steps < 1 ||
+        !std::isfinite(false_alarm_prob) || false_alarm_prob <= 0.0 || false_alarm_prob >= 1.0 ||
+        (p_requested && !p_parse_valid) ||
+        (p_requested && (train_mode || eval_mode)) ||
+        (eval_threshold_requested && !eval_mode) ||
         (drop_path.empty() != increase_path.empty()) ||
         (directional && (train_mode || eval_mode || drop_path == "-" || increase_path == "-")) ||
         (directional && (drop_path == increase_path || drop_path == out_path || increase_path == out_path)) ||
@@ -123,7 +138,7 @@ int main(int argc, char** argv) {
             std::mt19937 init_rng(seed);
             if (continue_weights) encoder.load_weights(weights_path);
             else encoder.init_kaiming(init_rng);
-            ContrastiveTrainer trainer(encoder, seed);
+            BarlowTwinsTrainer trainer(encoder, seed);
             trainer.train(pairs, steps, lr, quiet);
             encoder.save_weights(weights_path);
             return EXIT_NORMAL;
@@ -142,7 +157,7 @@ int main(int argc, char** argv) {
         append_pair(pairs, argv[optind], argv[optind + 1]);
         encoder.load_weights(weights_path);
         ChangeDetector detector(encoder);
-        const bool is_alert = detector.infer(pairs[0], stride, tile_thresh, alert_frac,
+        const bool is_alert = detector.infer(pairs[0], stride, false_alarm_prob,
                                              upsample, out_path, drop_path, increase_path,
                                              embedding_map_path, quiet);
         return is_alert ? EXIT_ALERT : EXIT_NORMAL;

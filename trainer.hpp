@@ -10,9 +10,9 @@
 #include <vector>
 namespace siam {
 
-class ContrastiveTrainer {
+class BarlowTwinsTrainer {
 public:
-    ContrastiveTrainer(SiameseEncoder& encoder, uint32_t seed)
+    BarlowTwinsTrainer(SiameseEncoder& encoder, uint32_t seed)
         : encoder_(encoder), rng_(seed), cache_t0_(Config::BATCH_N), cache_t1_(Config::BATCH_N),
           batch_t0_(Config::BATCH_N), batch_t1_(Config::BATCH_N) {}
 
@@ -65,46 +65,77 @@ public:
 private:
     float step_batch(float lr, float weight_decay) {
         constexpr int B = Config::BATCH_N;
+        constexpr int D = Config::EMBED_D;
+        constexpr float off_diagonal_weight = 0.005f;
+        constexpr float standardize_eps = 1e-4f;
         #pragma omp parallel for
         for (int i = 0; i < B; ++i) {
             encoder_.forward(batch_t0_[i], cache_t0_[i]);
             encoder_.forward(batch_t1_[i], cache_t1_[i]);
         }
-        float logits[B][B], probs_row[B][B], probs_col[B][B];
-        constexpr float inv_temp = 1.0f / Config::TEMP;
-        float loss_row = 0.0f, loss_col = 0.0f;
-        for (int i = 0; i < B; ++i) {
-            float max_l = -1e30f;
-            for (int j = 0; j < B; ++j) {
-                float dot = 0.0f;
-                for (int d = 0; d < Config::EMBED_D; ++d) dot += cache_t0_[i].u_hat[d] * cache_t1_[j].u_hat[d];
-                logits[i][j] = dot * inv_temp; max_l = std::max(max_l, logits[i][j]);
+        std::array<Embedding, B> z0{}, z1{}, d_z0{}, d_z1{}, d_u_hat{}, d_v_hat{};
+        std::array<float, D> mean0{}, mean1{}, inv_std0{}, inv_std1{};
+        for (int d = 0; d < D; ++d) {
+            for (int b = 0; b < B; ++b) {
+                mean0[d] += cache_t0_[b].u_hat[d] / static_cast<float>(B);
+                mean1[d] += cache_t1_[b].u_hat[d] / static_cast<float>(B);
             }
-            float sum_exp = 0.0f;
-            for (int j = 0; j < B; ++j) { probs_row[i][j] = std::exp(logits[i][j] - max_l); sum_exp += probs_row[i][j]; }
-            for (int j = 0; j < B; ++j) probs_row[i][j] /= sum_exp;
-            loss_row += -(logits[i][i] - max_l) + std::log(sum_exp);
+            float variance0 = 0.0f, variance1 = 0.0f;
+            for (int b = 0; b < B; ++b) {
+                const float centered0 = cache_t0_[b].u_hat[d] - mean0[d];
+                const float centered1 = cache_t1_[b].u_hat[d] - mean1[d];
+                variance0 += centered0 * centered0 / static_cast<float>(B);
+                variance1 += centered1 * centered1 / static_cast<float>(B);
+            }
+            inv_std0[d] = 1.0f / std::sqrt(variance0 + standardize_eps);
+            inv_std1[d] = 1.0f / std::sqrt(variance1 + standardize_eps);
+            for (int b = 0; b < B; ++b) {
+                z0[b][d] = (cache_t0_[b].u_hat[d] - mean0[d]) * inv_std0[d];
+                z1[b][d] = (cache_t1_[b].u_hat[d] - mean1[d]) * inv_std1[d];
+            }
         }
-        for (int j = 0; j < B; ++j) {
-            float max_l = -1e30f;
-            for (int i = 0; i < B; ++i) max_l = std::max(max_l, logits[i][j]);
-            float sum_exp = 0.0f;
-            for (int i = 0; i < B; ++i) { probs_col[i][j] = std::exp(logits[i][j] - max_l); sum_exp += probs_col[i][j]; }
-            for (int i = 0; i < B; ++i) probs_col[i][j] /= sum_exp;
-            loss_col += -(logits[j][j] - max_l) + std::log(sum_exp);
+
+        std::array<std::array<float, D>, D> correlation{}, d_correlation{};
+        float loss = 0.0f;
+        for (int i = 0; i < D; ++i) {
+            for (int j = 0; j < D; ++j) {
+                float value = 0.0f;
+                for (int b = 0; b < B; ++b) value += z0[b][i] * z1[b][j];
+                correlation[i][j] = value / static_cast<float>(B);
+                const float target = (i == j) ? 1.0f : 0.0f;
+                const float residual = correlation[i][j] - target;
+                const float weight = (i == j) ? 1.0f : off_diagonal_weight;
+                loss += weight * residual * residual;
+                d_correlation[i][j] = 2.0f * weight * residual;
+            }
         }
-        std::array<Embedding, B> d_u_hat{}, d_v_hat{};
-        constexpr float scale = 0.5f * inv_temp / static_cast<float>(B);
-        for (int i = 0; i < B; ++i) {
-            for (int j = 0; j < B; ++j) {
-                const float target = (i == j) ? 2.0f : 0.0f;
-                const float g = (probs_row[i][j] + probs_col[i][j] - target) * scale;
-                for (int d = 0; d < Config::EMBED_D; ++d) {
-                    d_u_hat[i][d] += g * cache_t1_[j].u_hat[d];
-                    d_v_hat[j][d] += g * cache_t0_[i].u_hat[d];
+
+        for (int b = 0; b < B; ++b) {
+            for (int i = 0; i < D; ++i) {
+                for (int j = 0; j < D; ++j) {
+                    d_z0[b][i] += d_correlation[i][j] * z1[b][j] / static_cast<float>(B);
+                    d_z1[b][j] += d_correlation[i][j] * z0[b][i] / static_cast<float>(B);
                 }
             }
         }
+
+        for (int d = 0; d < D; ++d) {
+            float mean_grad0 = 0.0f, mean_grad1 = 0.0f;
+            float mean_grad_z0 = 0.0f, mean_grad_z1 = 0.0f;
+            for (int b = 0; b < B; ++b) {
+                mean_grad0 += d_z0[b][d] / static_cast<float>(B);
+                mean_grad1 += d_z1[b][d] / static_cast<float>(B);
+                mean_grad_z0 += d_z0[b][d] * z0[b][d] / static_cast<float>(B);
+                mean_grad_z1 += d_z1[b][d] * z1[b][d] / static_cast<float>(B);
+            }
+            for (int b = 0; b < B; ++b) {
+                d_u_hat[b][d] = inv_std0[d] *
+                    (d_z0[b][d] - mean_grad0 - z0[b][d] * mean_grad_z0);
+                d_v_hat[b][d] = inv_std1[d] *
+                    (d_z1[b][d] - mean_grad1 - z1[b][d] * mean_grad_z1);
+            }
+        }
+
         float grad_arr[Config::TOTAL_PARAMS] = {0.0f};
         #pragma omp parallel for reduction(+:grad_arr[:Config::TOTAL_PARAMS])
         for (int i = 0; i < B; ++i) {
@@ -119,7 +150,7 @@ private:
             const float decay = (k < Config::TOTAL_WEIGHTS) ? (1.0f - lr * weight_decay) : 1.0f;
             net_p[k] = net_p[k] * decay - lr * velocity_.params[k];
         }
-        return 0.5f * (loss_row + loss_col) / static_cast<float>(B);
+        return loss;
     }
 
     SiameseEncoder& encoder_;

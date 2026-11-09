@@ -8,10 +8,15 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
+
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 namespace siam {
 
 class FileHandle {
@@ -43,6 +48,14 @@ inline void skip_comments_and_ws(FILE* fp) {
 }
 
 class PgmImage {
+private:
+    struct Mapping {
+        Mapping(void* address, size_t length) : address(address), length(length) {}
+        ~Mapping() { if (address != MAP_FAILED) munmap(address, length); }
+        void* address;
+        size_t length;
+    };
+
 public:
     PgmImage() = default;
     PgmImage(int width, int height)
@@ -80,13 +93,52 @@ public:
 
         const size_t sw = static_cast<size_t>(w), sh = static_cast<size_t>(h);
         if (sw > SIZE_MAX / sh) throw std::runtime_error("PGM dimensions overflow in " + path);
-        PgmImage img(w, h);
-        const size_t npixels = img.pixels_.size();
+        const size_t npixels = sw * sh;
         const float inv_max = 1.0f / static_cast<float>(maxv);
 
         if (std::strcmp(magic, "P5") == 0) {
             const size_t bpp = (maxv < 256) ? 1 : 2;
             if (npixels > SIZE_MAX / bpp) throw std::runtime_error("PGM payload size overflow in " + path);
+
+            /* Keep regular-file P5 pixels in the kernel-backed mapping. */
+            if (path != "-") {
+                const int fd = fileno(fp);
+                struct stat st {};
+                const off_t payload_offset = ftello(fp);
+                if (fd >= 0 && payload_offset >= 0 && fstat(fd, &st) == 0 &&
+                    S_ISREG(st.st_mode) && st.st_size >= payload_offset) {
+                    const uintmax_t file_size_u = static_cast<uintmax_t>(st.st_size);
+                    if (file_size_u > static_cast<uintmax_t>(SIZE_MAX))
+                        throw std::runtime_error("PGM file is too large to map: " + path);
+                    const size_t file_size = static_cast<size_t>(file_size_u);
+                    const size_t offset = static_cast<size_t>(payload_offset);
+                    const size_t payload_size = npixels * bpp;
+                    if (payload_size > file_size - offset)
+                        throw std::runtime_error("Truncated P5 payload in " + path);
+                    void* base = mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+                    if (base == MAP_FAILED)
+                        throw std::runtime_error("siam: failed to map PGM file: " + path);
+
+                    std::shared_ptr<Mapping> mapping;
+                    try {
+                        mapping = std::make_shared<Mapping>(base, file_size);
+                    } catch (...) {
+                        munmap(base, file_size);
+                        throw;
+                    }
+
+                    PgmImage img;
+                    img.width_ = w;
+                    img.height_ = h;
+                    img.mapping_ = std::move(mapping);
+                    img.mapped_payload_ = static_cast<const uint8_t*>(base) + offset;
+                    img.mapped_bytes_per_pixel_ = bpp;
+                    img.mapped_scale_ = inv_max;
+                    return img;
+                }
+            }
+
+            PgmImage img(w, h);
             std::vector<uint8_t> buf(npixels * bpp);
             if (std::fread(buf.data(), bpp, npixels, fp) != npixels)
                 throw std::runtime_error("Truncated P5 payload in " + path);
@@ -100,24 +152,26 @@ public:
                     img.pixels_[i] = static_cast<float>(val) * inv_max;
                 }
             }
+            return img;
         } else {
+            PgmImage img(w, h);
             for (size_t i = 0; i < npixels; ++i) {
                 int val = 0;
                 if (std::fscanf(fp, "%d", &val) != 1)
                     throw std::runtime_error("Truncated P2 payload in " + path);
                 img.pixels_[i] = static_cast<float>(val) * inv_max;
             }
+            return img;
         }
-        return img;
     }
 
     void save(const std::string& path) const {
         FileHandle fh(path, "wb", stdout);
         FILE* fp = fh.get();
-        const size_t npixels = pixels_.size();
+        const size_t npixels = static_cast<size_t>(width_) * static_cast<size_t>(height_);
         std::vector<uint8_t> buf(npixels);
         for (size_t i = 0; i < npixels; ++i) {
-            const float v = std::clamp(pixels_[i], 0.0f, 1.0f);
+            const float v = std::clamp(pixel(i), 0.0f, 1.0f);
             buf[i] = static_cast<uint8_t>(v * 255.0f + 0.5f);
         }
         std::fprintf(fp, "P5\n%d %d\n255\n", width_, height_);
@@ -134,7 +188,8 @@ public:
                 if (d4_mode & 1) sx = S - 1 - sx;
                 if (d4_mode & 2) sy = S - 1 - sy;
                 if (d4_mode & 4) std::swap(sx, sy);
-                float v = pixels_[(y0 + sy) * width_ + (x0 + sx)] * gain + bias;
+                const size_t index = static_cast<size_t>(y0 + sy) * width_ + (x0 + sx);
+                float v = pixel(index) * gain + bias;
                 v = std::clamp(v, 0.0f, 1.0f);
                 out[dy * S + dx] = (v - 0.5f) * 2.0f;
             }
@@ -152,16 +207,18 @@ public:
                                         0.0f, static_cast<float>(grid_h - 1));
             const int y0 = static_cast<int>(fy), y1 = std::min(y0 + 1, grid_h - 1);
             const float wy = fy - static_cast<float>(y0);
-            const float* row0 = &pixels_[static_cast<size_t>(y0) * grid_w];
-            const float* row1 = &pixels_[static_cast<size_t>(y1) * grid_w];
             float* dst_row = &dst.pixels_[static_cast<size_t>(y) * out_w];
             for (int x = 0; x < out_w; ++x) {
                 const float fx = std::clamp((static_cast<float>(x) - half_patch) * inv_stride,
                                             0.0f, static_cast<float>(grid_w - 1));
                 const int x0 = static_cast<int>(fx), x1 = std::min(x0 + 1, grid_w - 1);
                 const float wx = fx - static_cast<float>(x0);
-                const float top = row0[x0] + wx * (row0[x1] - row0[x0]);
-                const float bot = row1[x0] + wx * (row1[x1] - row1[x0]);
+                const float top0 = pixel(static_cast<size_t>(y0) * grid_w + x0);
+                const float top1 = pixel(static_cast<size_t>(y0) * grid_w + x1);
+                const float bot0 = pixel(static_cast<size_t>(y1) * grid_w + x0);
+                const float bot1 = pixel(static_cast<size_t>(y1) * grid_w + x1);
+                const float top = top0 + wx * (top1 - top0);
+                const float bot = bot0 + wx * (bot1 - bot0);
                 dst_row[x] = top + wy * (bot - top);
             }
         }
@@ -170,13 +227,42 @@ public:
 
     int width() const noexcept { return width_; }
     int height() const noexcept { return height_; }
-    float* data() noexcept { return pixels_.data(); }
-    const float* data() const noexcept { return pixels_.data(); }
+    float* data() { materialize(); return pixels_.data(); }
+    const float* data() const { materialize(); return pixels_.data(); }
+
+    float pixel(size_t index) const noexcept {
+        if (!mapped_payload_) return pixels_[index];
+        if (mapped_bytes_per_pixel_ == 1)
+            return static_cast<float>(mapped_payload_[index]) * mapped_scale_;
+        const size_t byte_index = index * 2;
+        const uint16_t value = (static_cast<uint16_t>(mapped_payload_[byte_index]) << 8) |
+                               static_cast<uint16_t>(mapped_payload_[byte_index + 1]);
+        return static_cast<float>(value) * mapped_scale_;
+    }
+
+    void copy_pixels(size_t offset, size_t count, float* destination) const noexcept {
+        for (size_t i = 0; i < count; ++i) destination[i] = pixel(offset + i);
+    }
 
 private:
+    void materialize() const {
+        if (!mapped_payload_) return;
+        const size_t count = static_cast<size_t>(width_) * static_cast<size_t>(height_);
+        std::vector<float> converted(count);
+        for (size_t i = 0; i < count; ++i) converted[i] = pixel(i);
+        pixels_.swap(converted);
+        mapped_payload_ = nullptr;
+        mapped_bytes_per_pixel_ = 0;
+        mapping_.reset();
+    }
+
     int width_ = 0;
     int height_ = 0;
-    std::vector<float> pixels_;
+    mutable std::vector<float> pixels_;
+    mutable std::shared_ptr<Mapping> mapping_;
+    mutable const uint8_t* mapped_payload_ = nullptr;
+    mutable size_t mapped_bytes_per_pixel_ = 0;
+    float mapped_scale_ = 1.0f;
 };
 
 struct ImagePair { PgmImage pre; PgmImage post; };

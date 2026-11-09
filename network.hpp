@@ -15,6 +15,9 @@
 #include <vector>
 namespace siam {
 
+constexpr std::array<int, 4> SCENE_POOL_SCALES{{4, 8, 16, 32}};
+using EmbeddingPyramid = std::array<std::vector<Embedding>, SCENE_POOL_SCALES.size()>;
+
 struct WeightHeader {
     uint32_t magic;
     uint16_t patch_s, c1, c2, embed_d;
@@ -244,23 +247,27 @@ public:
         }
     }
 
-    std::vector<Embedding> extract_scene_embeddings(const PgmImage& img,
-                                                     int height, int width, int stride) const {
+    EmbeddingPyramid extract_scene_embedding_pyramid(const PgmImage& img,
+                                                       int height, int width, int stride) const {
         const int grid_h = (height - Config::PATCH_S) / stride + 1;
         const int grid_w = (width - Config::PATCH_S) / stride + 1;
-        std::vector<Embedding> u_hat_grid(static_cast<size_t>(grid_h) * grid_w);
+        const size_t tile_count = static_cast<size_t>(grid_h) * grid_w;
+        EmbeddingPyramid pyramid{};
         if (stride % 4 != 0) {
+            pyramid[1].resize(tile_count);
             #pragma omp parallel for collapse(2)
             for (int gy = 0; gy < grid_h; ++gy) {
                 for (int gx = 0; gx < grid_w; ++gx) {
                     Patch p; BranchCache c;
                     img.extract_patch(gy * stride, gx * stride, p);
                     forward(p, c);
-                    u_hat_grid[static_cast<size_t>(gy) * grid_w + gx] = c.u_hat;
+                    pyramid[1][static_cast<size_t>(gy) * grid_w + gx] = c.u_hat;
                 }
             }
-            return u_hat_grid;
+            return pyramid;
         }
+
+        for (auto& level : pyramid) level.resize(tile_count);
 
         const int h1 = height / 2, w1_dim = width / 2;
         const int h2 = h1 / 2, w2_dim = w1_dim / 2;
@@ -272,10 +279,9 @@ public:
         std::vector<float> z2_buf(static_cast<size_t>(Config::C2) * h2 * w2_dim, 0.0f);
         std::vector<double> sat(static_cast<size_t>(Config::C2) * sat_h * sat_w, 0.0);
         for (int y = 0; y < height; ++y) {
-            const float* src = &img.data()[static_cast<size_t>(y) * img.width()];
             float* dst = &in_pad[static_cast<size_t>(y + 1) * p0_w + 1];
             for (int x = 0; x < width; ++x) {
-                const float v = std::clamp(src[x], 0.0f, 1.0f);
+                const float v = std::clamp(img.pixel(static_cast<size_t>(y) * width + x), 0.0f, 1.0f);
                 dst[x] = (v - 0.5f) * 2.0f;
             }
         }
@@ -335,39 +341,79 @@ public:
             }
         }
 
-        constexpr double inv_spatial = 1.0 / static_cast<double>(Config::H2 * Config::H2);
         #pragma omp parallel for collapse(2)
         for (int gy = 0; gy < grid_h; ++gy) {
             for (int gx = 0; gx < grid_w; ++gx) {
                 const int y1 = (gy * stride) >> 2, x1 = (gx * stride) >> 2;
-                const int y2 = y1 + Config::H2, x2 = x1 + Config::H2;
-                std::array<float, Config::C2> gap{};
-                for (int oc = 0; oc < Config::C2; ++oc) {
-                    const double* sat_oc = &sat[static_cast<size_t>(oc) * sat_h * sat_w];
-                    const double sum = sat_oc[static_cast<size_t>(y2) * sat_w + x2]
-                                     - sat_oc[static_cast<size_t>(y1) * sat_w + x2]
-                                     - sat_oc[static_cast<size_t>(y2) * sat_w + x1]
-                                     + sat_oc[static_cast<size_t>(y1) * sat_w + x1];
-                    gap[oc] = static_cast<float>(sum * inv_spatial);
-                }
-                Embedding u{};
-                float norm_sq = 1e-12f;
-                for (int d = 0; d < Config::EMBED_D; ++d) {
-                    float sum = weights_.b3()[d];
-                    for (int ic = 0; ic < Config::C2; ++ic) sum += weights_.w3()[d * Config::C2 + ic] * gap[ic];
-                    u[d] = sum; norm_sq += sum * sum;
-                }
-                const float inv_norm = 1.0f / std::sqrt(norm_sq);
-                Embedding& u_hat = u_hat_grid[static_cast<size_t>(gy) * grid_w + gx];
-                for (int d = 0; d < Config::EMBED_D; ++d) u_hat[d] = u[d] * inv_norm;
+                const size_t tile = static_cast<size_t>(gy) * grid_w + gx;
+                for (size_t level = 0; level < SCENE_POOL_SCALES.size(); ++level)
+                    pyramid[level][tile] = pool_sat_window(sat, sat_w, sat_h, y1, x1,
+                                                           SCENE_POOL_SCALES[level]);
             }
         }
-        return u_hat_grid;
+        return pyramid;
+    }
+
+    std::vector<Embedding> extract_scene_embeddings(const PgmImage& img,
+                                                     int height, int width, int stride) const {
+        const int grid_h = (height - Config::PATCH_S) / stride + 1;
+        const int grid_w = (width - Config::PATCH_S) / stride + 1;
+        const size_t tile_count = static_cast<size_t>(grid_h) * grid_w;
+        const EmbeddingPyramid pyramid = extract_scene_embedding_pyramid(img, height, width, stride);
+        std::vector<Embedding> fused(tile_count);
+        size_t active_levels = 0;
+        for (const auto& level : pyramid) if (level.size() == tile_count) ++active_levels;
+        const float inv_levels = 1.0f / static_cast<float>(std::max<size_t>(1, active_levels));
+        for (size_t tile = 0; tile < tile_count; ++tile) {
+            Embedding sum{};
+            for (const auto& level : pyramid) {
+                if (level.size() != tile_count) continue;
+                for (int d = 0; d < Config::EMBED_D; ++d) sum[d] += level[tile][d];
+            }
+            float norm_sq = 1e-12f;
+            for (float& value : sum) {
+                value *= inv_levels;
+                norm_sq += value * value;
+            }
+            const float inv_norm = 1.0f / std::sqrt(norm_sq);
+            for (int d = 0; d < Config::EMBED_D; ++d) fused[tile][d] = sum[d] * inv_norm;
+        }
+        return fused;
     }
 
     NetworkParams& weights() noexcept { return weights_; }
     const NetworkParams& weights() const noexcept { return weights_; }
 private:
+    Embedding pool_sat_window(const std::vector<double>& sat, int sat_w, int sat_h,
+                              int y1, int x1, int box_h2) const noexcept {
+        const int y2 = std::min(y1 + box_h2, sat_h - 1);
+        const int x2 = std::min(x1 + box_h2, sat_w - 1);
+        const int area = std::max(1, (y2 - y1) * (x2 - x1));
+        const double inv_area = 1.0 / static_cast<double>(area);
+        std::array<float, Config::C2> gap{};
+        for (int oc = 0; oc < Config::C2; ++oc) {
+            const double* sat_oc = &sat[static_cast<size_t>(oc) * sat_h * sat_w];
+            const double sum = sat_oc[static_cast<size_t>(y2) * sat_w + x2]
+                             - sat_oc[static_cast<size_t>(y1) * sat_w + x2]
+                             - sat_oc[static_cast<size_t>(y2) * sat_w + x1]
+                             + sat_oc[static_cast<size_t>(y1) * sat_w + x1];
+            gap[oc] = static_cast<float>(sum * inv_area);
+        }
+
+        Embedding embedding{};
+        float norm_sq = 1e-12f;
+        for (int d = 0; d < Config::EMBED_D; ++d) {
+            float value = weights_.b3()[d];
+            for (int ic = 0; ic < Config::C2; ++ic)
+                value += weights_.w3()[d * Config::C2 + ic] * gap[ic];
+            embedding[d] = value;
+            norm_sq += value * value;
+        }
+        const float inv_norm = 1.0f / std::sqrt(norm_sq);
+        for (float& value : embedding) value *= inv_norm;
+        return embedding;
+    }
+
     NetworkParams weights_{};
 };
 

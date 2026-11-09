@@ -16,7 +16,6 @@ struct Config {
     static constexpr int H2 = 8;
     static constexpr int EMBED_D = 32;
     static constexpr int BATCH_N = 64;
-    static constexpr float TEMP = 0.07f;
     static constexpr int NUM_W1 = C1 * 9;
     static constexpr int NUM_W2 = C2 * C1 * 9;
     static constexpr int NUM_W3 = EMBED_D * C2;

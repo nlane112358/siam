@@ -1,6 +1,6 @@
 # siam
 
-Zero-dependency C++17 Siamese Contrastive (Symmetric InfoNCE / Cosine Distance) engine for self-supervised satellite & SAR image change detection on Netpbm PGM (`P5`/`P2`, 8-bit & 16-bit) imagery.
+Zero-dependency C++17 Siamese Barlow Twins engine for self-supervised satellite & SAR image change detection on Netpbm PGM (`P5`/`P2`, 8-bit & 16-bit) imagery.
 
 ## Build
 
@@ -51,8 +51,9 @@ OPTIONS
     -n STEPS        training steps [200]
     -l RATE         learning rate [0.01]
     -S SEED         random seed [time and process ID]
-    -a VALUE        tile distance threshold [0.35]
-    -f VALUE        alert fraction threshold [0.05]
+    -p VALUE        image false-alarm probability for inference [1e-6]
+    -a VALUE        evaluation cosine-distance threshold [0.35]
+    -f VALUE        evaluation alert fraction threshold [0.05]
     -s PIXELS       sliding-window stride [8]
 
 EXIT STATUS
@@ -69,7 +70,9 @@ EXAMPLES
 ```
 
 ### 1. Train (`-t`)
-Train across multiple `<pre.pgm> <post.pgm>` pairs via positional arguments, `-L <list.txt>`, or streamed from `stdin` (`-`):
+Train with a Barlow Twins cross-correlation objective across multiple
+`<pre.pgm> <post.pgm>` pairs via positional arguments, `-L <list.txt>`, or
+streamed from `stdin` (`-`):
 
 ```sh
 paste <(find pgm_floods -name '*_pre.pgm' | sort | head -n 300) \
@@ -98,21 +101,33 @@ siam: evaluated 103 pairs (383263 tiles, stride=8, thresh=0.35)
 Follows POSIX `diff(1)` / `cmp(1)` exit conventions (`0` = normal, `1` = anomaly alert triggered, `2` = error):
 
 ```sh
-./siam -w flood.w -a 0.35 -f 0.05 pre.pgm post.pgm > change_map.pgm || notify_alert
+./siam -w flood.w -p 1e-6 pre.pgm post.pgm > change_map.pgm || notify_alert
 ```
+
+Inference computes motion-aligned embedding residuals, estimates their scene mean
+and covariance, and whitens them with the shared 32-dimensional Jacobi spectral
+decomposition. A Wilson–Hilferty approximation maps each Mahalanobis distance to
+a chi-square tail probability. `-p` is the target image-level false-alarm rate;
+the detector uses a Bonferroni per-tile cutoff (`-p / tile_count`) and alerts if
+any tile crosses it. The output map stores `1 − tile_p`, so brighter values mean
+more anomalous tiles. This calibration is approximate: it assumes approximately
+Gaussian residuals, while the scene mean and covariance are estimated from the
+same image being scored and the local motion match selects the best candidate.
+The status line also reports 8-connected significant-tile blobs and the largest
+blob area in tiles.
 
 To split anomalous tiles by backscatter direction, request both directional maps:
 
 ```sh
-./siam -w flood.w -s 16 -a 0.35 \
+./siam -w flood.w -s 16 -p 1e-6 \
   -o change_map.pgm -D backscatter_drop.pgm -I backscatter_increase.pgm \
   pre.pgm post.pgm
 ```
 
-Each 32×32 window is assigned to the drop or increase map when its cosine distance
-meets `-a` and its mean `POST−PRE` pixel difference is negative or positive,
-respectively. The map retains the cosine-distance value for those tiles and zeros
-the rest. `-u` upsamples all three outputs. This is a directional gate: on
+Each 32×32 window is assigned to the drop or increase map when its tile p-value
+meets the image-adjusted `-p` cutoff and its mean `POST−PRE` pixel difference is
+negative or positive, respectively. The map retains the `1 − tile_p` score for
+those tiles and zeros the rest. `-u` upsamples all three outputs. This is a directional gate: on
 calibrated dB inputs, the sign corresponds to ΔdB; on linear backscatter inputs,
 the sign of each pixel difference corresponds to the sign of its dB change. Use
 the same calibration and intensity scaling for both images. Independently
