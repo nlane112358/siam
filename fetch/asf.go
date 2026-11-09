@@ -52,7 +52,7 @@ func main() {
 	bbox := flag.String("bbox", "", "west,south,east,north (required)")
 	from := flag.String("from", "", "start date YYYY-MM-DD (required)")
 	to := flag.String("to", "", "end date YYYY-MM-DD (required)")
-	out := flag.String("out", "asf-data/tif", "output directory for extracted TIFFs")
+	out := flag.String("out", "/Users/nlane/Development/siam/data", "output directory for extracted TIFFs")
 	direction := flag.String("direction", "", "ASCENDING or DESCENDING")
 	orbit := flag.String("orbit", "", "relative orbit number")
 	polFlag := flag.String("pol", "vv,vh", "polarizations to extract: vv, vh, or vv,vh")

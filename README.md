@@ -136,3 +136,66 @@ blue channels. The colors show relative embedding variation within that scene,
 so coherent regions may emerge, but colors do not have fixed meanings such as
 water or urban and are not comparable across scenes. The `-u` option only
 upsamples the PGM inference and directional maps.
+
+The displayed PNG masks zero-valued tile centers outside the valid data footprint; the P6 output from `siam` retains the computed colors for every tile.
+
+![PCA false-color embedding example](docs/pca-embedding.png)
+
+## SAR examples
+
+These exploratory panels show full-scene Sentinel-1 inputs and model distance maps, plus training and held-out chips. The full-scene pass uses stride 16; change maps are contrast-stretched for display.
+
+![Sentinel-1 SAR example](docs/sar-full-scene.png)
+
+## Sentinel-1 preparation with the Go tools
+
+The utilities in `fetch/` are `asf.go`, which searches and downloads Sentinel-1 scenes from ASF DAAC, and `sarimg.go`, which converts, aligns, and chips SAR imagery and builds chronological training pairs.
+
+### Build and requirements
+
+From the project root, build `siam`, then build the Go utilities from `fetch/`:
+
+```sh
+make
+cd fetch
+go build -o asf asf.go
+go build -o sarimg sarimg.go
+```
+
+Both Go programs use the standard library. For TIFF input, `sarimg` needs GDAL `gdal_translate`; when using `-bbox`, it also uses `gdalwarp`. PGM and PPM input does not require GDAL.
+
+### Search and download scenes
+
+Use a west,south,east,north bounding box and ISO dates. This search lists matching scenes without downloading them, so Earthdata credentials are not needed:
+
+```sh
+./asf -bbox="-5.5,49.9,1.8,53.5" -from=2025-05-01 -to=2025-10-01 \
+  -orbit=35 -direction=DESCENDING -pol=vv -ls
+```
+
+For downloads, set either `EARTHDATA_TOKEN` or both `EARTHDATA_USERNAME` and `EARTHDATA_PASSWORD`. Then pipe the TIFF paths printed by `asf` into `sarimg`:
+
+```sh
+export EARTHDATA_TOKEN="YOUR_EARTHDATA_TOKEN"
+./asf -bbox="-5.5,49.9,1.8,53.5" -from=2025-05-01 -to=2025-10-01 \
+  -orbit=35 -direction=DESCENDING -pol=vv -out=../data/england/tif \
+  | ./sarimg -bbox="-5.5,49.9,1.8,53.5" -res=10 \
+      -o ../data/england -to=pgm,png -chip=1024 -min-cov=0.85
+```
+
+The example writes TIFFs to `data/england/tif`, 16-bit PGM chips to `data/england/pgm`, and display PNG chips to `data/england/png`. TIFF inputs receive a nonzero-pixel p2-p98 stretch by default. `-bbox` aligns scenes to a shared UTM grid; `-res` sets its pixel size in metres. `-chip` sets the square chip size, while `-min-cov` filters chips by their fraction of nonzero pixels. Set the dates, bounding box, orbit, direction, polarization, and output directory for your area. Pass `-out` to `asf` and `-o` to `sarimg` to choose output paths.
+
+Use `asf -h` and `sarimg -h` for all options. `asf -ls` prints a scene catalog; `-scenes` can restrict a download to comma-separated scene names. The default polarization selection is `vv,vh`; downloads use three workers by default.
+
+### Create pairs and train
+
+After preparing PGM chips, run this from `fetch/` to write adjacent chronological pairs for each polarization and chip position, then train `siam`:
+
+```sh
+./sarimg -pairs -o ../data/england/pgm ../data/england/pgm \
+  > ../data/england/pairs.txt
+../siam -t -w ../data/england/siam.w -n 300 \
+  -L ../data/england/pairs.txt
+```
+
+`sarimg -pairs` writes the pair list to standard output. Keep the PGM output directory as both the input and `-o` path to reuse the existing chips.

@@ -58,7 +58,7 @@ func main() {
 	var cfg config
 	toFlag := flag.String("to", "auto", "output format(s): pgm, png, or pgm,png (auto: pgm for TIFF when -pairs, else png)")
 	bboxFlag := flag.String("bbox", "", "west,south,east,north: warp TIFFs to a shared UTM grid")
-	flag.StringVar(&cfg.out, "o", "asf-data", "output directory, file path, or '-' for stdout")
+	flag.StringVar(&cfg.out, "o", "/Users/nlane/Development/siam/data", "output directory, file path, or '-' for stdout")
 	flag.Float64Var(&cfg.res, "res", 10.0, "target pixel resolution in meters when -bbox is set")
 	flag.Float64Var(&cfg.minCov, "min-cov", 0.0, "minimum nonzero pixel fraction [0..1] (default 0.90 if -bbox/-chip)")
 	flag.IntVar(&cfg.chip, "chip", 0, "slice into NxN pixel chips (e.g. 1024; 0 = full image)")

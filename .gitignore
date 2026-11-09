@@ -65,3 +65,8 @@ alerts_floods/
 siam
 fetch/asf-data/*
 !fetch/asf-data/convert_tifs_to_png.py
+
+# Generated Sentinel-1 datasets and local Go executables
+/fetch/data_*/
+/fetch/asf
+/fetch/sarimg
