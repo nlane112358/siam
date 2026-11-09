@@ -12,12 +12,12 @@ make OMP=1    # multi-threaded (OpenMP)
 Or compile directly:
 
 ```sh
-g++ -std=c++17 -O3 -march=native -Wall -Wextra -Wno-unknown-pragmas main.cpp -lm -o siam
+g++ -std=c++17 -O3 -march=native -Wall -Wextra -Wno-unknown-pragmas main.cpp -lm -o bin/siam
 ```
 
 ## Usage
 
-The command-line reference is also available with `siam -h`:
+The command-line reference is also available with `./bin/siam -h`:
 
 ```text
 NAME
@@ -89,7 +89,7 @@ background appearance.
 ```sh
 paste <(find pgm_floods -name '*_pre.pgm' | sort | head -n 300) \
       <(find pgm_floods -name '*_post.pgm' | sort | head -n 300) \
-  | ./siam -t -w flood.w -n 100000 -
+  | ./bin/siam -t -w flood.w -n 100000 -
 ```
 
 ### 2. Evaluate (`-e`)
@@ -98,7 +98,7 @@ Compute label-free Matched vs. Mismatched Tile ROC-AUC across held-out image pai
 ```sh
 paste <(find pgm_floods -name '*_pre.pgm' | sort | tail -n 103) \
       <(find pgm_floods -name '*_post.pgm' | sort | tail -n 103) \
-  | ./siam -e -w flood.w -
+  | ./bin/siam -e -w flood.w -
 ```
 
 ```text
@@ -113,13 +113,13 @@ siam: evaluated 103 pairs (383263 tiles, stride=8, thresh=0.35)
 Follows POSIX `diff(1)` / `cmp(1)` exit conventions (`0` = normal, `1` = anomaly alert triggered, `2` = error):
 
 ```sh
-./siam -w flood.w -p 1e-6 pre.pgm post.pgm > change_map.pgm || notify_alert
+./bin/siam -w flood.w -p 1e-6 pre.pgm post.pgm > change_map.pgm || notify_alert
 ```
 
 To save the aligned displacement field alongside the innovation map:
 
 ```sh
-./siam -w flood.w -p 1e-6 -o innovation.pgm -m motion.ppm pre.pgm post.pgm
+./bin/siam -w flood.w -p 1e-6 -o innovation.pgm -m motion.ppm pre.pgm post.pgm
 ```
 
 Inference computes motion-aligned embedding residuals, estimates their scene mean
@@ -152,8 +152,8 @@ levels. The PPM uses one pixel per tile; `-u` upsamples it to input dimensions.
 For a continuous sequence, pass one frame per invocation with `-M scene.state`:
 
 ```sh
-./siam -M scene.state -w flood.w -p 1e-6 frame_001.pgm
-./siam -M scene.state -w flood.w -p 1e-6 frame_002.pgm
+./bin/siam -M scene.state -w flood.w -p 1e-6 frame_001.pgm
+./bin/siam -M scene.state -w flood.w -p 1e-6 frame_002.pgm
 ```
 
 The first frame initializes the state and produces no alert. Later frames are
@@ -169,7 +169,7 @@ and the image-level `-p` cutoff corrected across tiles.
 To split anomalous tiles by backscatter direction, request both directional maps:
 
 ```sh
-./siam -w flood.w -s 16 -p 1e-6 \
+./bin/siam -w flood.w -s 16 -p 1e-6 \
   -o change_map.pgm -D backscatter_drop.pgm -I backscatter_increase.pgm \
   pre.pgm post.pgm
 ```
@@ -192,7 +192,7 @@ To visualize the learned embedding across the POST scene, request a PCA
 false-color image:
 
 ```sh
-./siam -w flood.w -o change_map.pgm -v embeddings.ppm pre.pgm post.pgm
+./bin/siam -w flood.w -o change_map.pgm -v embeddings.ppm pre.pgm post.pgm
 ```
 
 `embeddings.ppm` is a binary P6 image with one pixel per inference tile. PCA is
@@ -215,18 +215,17 @@ These exploratory panels show full-scene Sentinel-1 inputs and model distance ma
 
 ## Sentinel-1 preparation with the Go tools
 
-The utilities in `fetch/` are `asf.go`, which searches and downloads Sentinel-1 scenes from ASF DAAC, and `sarimg.go`, which converts, aligns, and chips SAR imagery and builds chronological training pairs.
+The utilities in `tools/` are `asf.go`, which searches and downloads Sentinel-1 scenes from ASF DAAC, and `sarimg.go`, which converts, aligns, and chips SAR imagery and builds chronological training pairs.
 
 ### Build and requirements
 
-From the project root, build `siam`, then build the Go utilities from `fetch/`:
+From the project root, build `siam` and both Go utilities:
 
 ```sh
 make
-cd fetch
-go build -o asf asf.go
-go build -o sarimg sarimg.go
 ```
+
+This creates `bin/siam`, `bin/asf`, and `bin/sarimg`. `make clean` removes the binaries and keeps the `bin/` directory.
 
 Both Go programs use the standard library. For TIFF input, `sarimg` needs GDAL `gdal_translate`; when using `-bbox`, it also uses `gdalwarp`. PGM and PPM input does not require GDAL.
 
@@ -235,7 +234,7 @@ Both Go programs use the standard library. For TIFF input, `sarimg` needs GDAL `
 Use a west,south,east,north bounding box and ISO dates. This search lists matching scenes without downloading them, so Earthdata credentials are not needed:
 
 ```sh
-./asf -bbox="-5.5,49.9,1.8,53.5" -from=2025-05-01 -to=2025-10-01 \
+./bin/asf -bbox="-5.5,49.9,1.8,53.5" -from=2025-05-01 -to=2025-10-01 \
   -orbit=35 -direction=DESCENDING -pol=vv -ls
 ```
 
@@ -243,9 +242,9 @@ For downloads, set either `EARTHDATA_TOKEN` or both `EARTHDATA_USERNAME` and `EA
 
 ```sh
 export EARTHDATA_TOKEN="YOUR_EARTHDATA_TOKEN"
-./asf -bbox="-5.5,49.9,1.8,53.5" -from=2025-05-01 -to=2025-10-01 \
+./bin/asf -bbox="-5.5,49.9,1.8,53.5" -from=2025-05-01 -to=2025-10-01 \
   -orbit=35 -direction=DESCENDING -pol=vv -out=../data/england/tif \
-  | ./sarimg -bbox="-5.5,49.9,1.8,53.5" -res=10 \
+  | ./bin/sarimg -bbox="-5.5,49.9,1.8,53.5" -res=10 \
       -o ../data/england -to=pgm,png -chip=1024 -min-cov=0.85
 ```
 
@@ -255,12 +254,12 @@ Use `asf -h` and `sarimg -h` for all options. `asf -ls` prints a scene catalog; 
 
 ### Create pairs and train
 
-After preparing PGM chips, run this from `fetch/` to write adjacent chronological pairs for each polarization and chip position, then train `siam`:
+After preparing PGM chips, run this from `tools/` to write adjacent chronological pairs for each polarization and chip position, then train `siam`:
 
 ```sh
-./sarimg -pairs -o ../data/england/pgm ../data/england/pgm \
+../bin/sarimg -pairs -o ../data/england/pgm ../data/england/pgm \
   > ../data/england/pairs.txt
-../siam -t -w ../data/england/siam.w -n 300 \
+../bin/siam -t -w ../data/england/siam.w -n 300 \
   -L ../data/england/pairs.txt
 ```
 
