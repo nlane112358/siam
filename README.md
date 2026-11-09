@@ -136,20 +136,3 @@ blue channels. The colors show relative embedding variation within that scene,
 so coherent regions may emerge, but colors do not have fixed meanings such as
 water or urban and are not comparable across scenes. The `-u` option only
 upsamples the PGM inference and directional maps.
-
-This full-scene example uses the original 29,531×21,940 Sentinel-1 inputs with
-stride 8 and no input resampling. The displayed PNG masks zero-valued tile
-centers outside the valid data footprint; the P6 output from `siam` retains the
-computed colors for every tile.
-
-![Full-scene Sentinel-1 embedding PCA](docs/full_scene_embedding_pca.png)
-
-## SAR examples
-
-These exploratory panels show full-scene Sentinel-1 inputs and model distance maps, plus training and held-out chips. The full-scene pass uses stride 16; change maps are contrast-stretched for display.
-
-![Full-scene contrast-stretched change map](docs/full_scene_change_scaled.png)
-
-![Full-scene SAR inference](docs/full_scene_panel.png)
-
-![Training and evaluation chips](docs/change_panel.png)

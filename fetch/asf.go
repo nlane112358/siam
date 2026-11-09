@@ -1,8 +1,9 @@
-// Search ASF for Sentinel-1 IW GRD scenes, extract the VV GeoTIFF, and make a PGM.
+// asf.go - Search NASA ASF Sentinel-1 GRD scenes and extract VV/VH GeoTIFFs.
 package main
 
 import (
 	"archive/zip"
+	"bufio"
 	"context"
 	"encoding/json"
 	"flag"
@@ -13,12 +14,12 @@ import (
 	"net/http/cookiejar"
 	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"text/tabwriter"
 	"time"
 )
 
@@ -27,13 +28,23 @@ const api = "https://api.daac.asf.alaska.edu/services/search/param"
 type result struct {
 	Features []struct {
 		Properties struct {
-			URL       string `json:"url"`
-			FileName  string `json:"fileName"`
-			SceneName string `json:"sceneName"`
+			URL             string      `json:"url"`
+			FileName        string      `json:"fileName"`
+			SceneName       string      `json:"sceneName"`
+			StartTime       string      `json:"startTime"`
+			FlightDirection string      `json:"flightDirection"`
+			Polarization    string      `json:"polarization"`
+			PathNumber      json.Number `json:"pathNumber"`
+			Bytes           json.Number `json:"bytes"`
 		} `json:"properties"`
 	} `json:"features"`
 }
-type scene struct{ name, url string }
+
+type scene struct {
+	name, url, date, dir, orbit, pols string
+	ts                                time.Time
+	bytes                             int64
+}
 
 func main() {
 	log.SetFlags(0)
@@ -41,16 +52,19 @@ func main() {
 	bbox := flag.String("bbox", "", "west,south,east,north (required)")
 	from := flag.String("from", "", "start date YYYY-MM-DD (required)")
 	to := flag.String("to", "", "end date YYYY-MM-DD (required)")
-	out := flag.String("out", "asf-data", "output directory")
+	out := flag.String("out", "asf-data/tif", "output directory for extracted TIFFs")
 	direction := flag.String("direction", "", "ASCENDING or DESCENDING")
 	orbit := flag.String("orbit", "", "relative orbit number")
+	polFlag := flag.String("pol", "vv,vh", "polarizations to extract: vv, vh, or vv,vh")
+	scenesFlag := flag.String("scenes", "", "comma-separated scene names, or '-' to read from stdin")
+	listOnly := flag.Bool("ls", false, "list available scenes to stdout without downloading")
 	workers := flag.Int("workers", 3, "concurrent downloads")
 	limit := flag.Int("limit", 100, "maximum search results")
 	flag.Parse()
 
 	if *bbox == "" || *from == "" || *to == "" || *workers < 1 || *limit < 1 {
 		flag.Usage()
-		log.Fatal("bbox, dates, workers and limit are required and must be valid")
+		log.Fatal("bbox, dates, workers, and limit are required")
 	}
 	if _, err := time.Parse("2006-01-02", *from); err != nil {
 		log.Fatalf("from: %v", err)
@@ -58,50 +72,84 @@ func main() {
 	if _, err := time.Parse("2006-01-02", *to); err != nil {
 		log.Fatalf("to: %v", err)
 	}
-	if strings.ToUpper(*direction) != "" && strings.ToUpper(*direction) != "ASCENDING" && strings.ToUpper(*direction) != "DESCENDING" {
+	dir := strings.ToUpper(strings.TrimSpace(*direction))
+	if dir != "" && dir != "ASCENDING" && dir != "DESCENDING" {
 		log.Fatal("direction must be ASCENDING or DESCENDING")
 	}
+	pols, err := parsePols(*polFlag)
+	if err != nil {
+		log.Fatal(err)
+	}
+	selected, err := parseSelected(*scenesFlag)
+	if err != nil {
+		log.Fatalf("scenes: %v", err)
+	}
 
-	client := earthdataClient()
+	client := earthdataClient(*listOnly)
 	progress.Printf("search: ASF")
-	scenes, err := search(context.Background(), client, *bbox, *from, *to, *direction, *orbit, *limit)
+	scenes, err := search(context.Background(), client, *bbox, *from, *to, dir, *orbit, *limit, selected)
 	if err != nil {
 		log.Fatal(err)
 	}
 	progress.Printf("search: %d scenes", len(scenes))
 	if len(scenes) == 0 {
-		progress.Printf("done: 0; failed: 0")
 		return
 	}
-	for _, d := range []string{"tif", "pgm", "raw"} {
-		if err := os.MkdirAll(filepath.Join(*out, d), 0o755); err != nil {
+	if *listOnly {
+		printCatalog(os.Stdout, scenes)
+		return
+	}
+
+	rawDir := filepath.Join(*out, ".raw")
+	for _, d := range []string{*out, rawDir} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
 			log.Fatal(err)
 		}
 	}
 
-	jobs, errs := make(chan scene), make(chan error, len(scenes))
+	type outcome struct {
+		idx   int
+		paths []string
+		err   error
+	}
+	jobs := make(chan int, len(scenes))
+	results := make(chan outcome, len(scenes))
 	var wg sync.WaitGroup
 	for i := 0; i < *workers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for s := range jobs {
-				if err := process(context.Background(), client, s, *out, progress); err != nil {
+			for idx := range jobs {
+				s := scenes[idx]
+				paths, err := fetchScene(context.Background(), client, s, *out, rawDir, pols, progress)
+				if err != nil {
 					progress.Printf("fail %s: %v", shortName(s.name), err)
-					errs <- err
 				}
+				results <- outcome{idx: idx, paths: paths, err: err}
 			}
 		}()
 	}
-	for _, s := range scenes {
-		jobs <- s
+	for i := range scenes {
+		jobs <- i
 	}
 	close(jobs)
 	wg.Wait()
-	close(errs)
+	close(results)
+	_ = os.Remove(rawDir)
+
+	ordered := make([][]string, len(scenes))
 	failed := 0
-	for range errs {
-		failed++
+	for r := range results {
+		if r.err != nil {
+			failed++
+		} else {
+			ordered[r.idx] = r.paths
+		}
+	}
+	for _, paths := range ordered {
+		for _, p := range paths {
+			fmt.Println(p)
+		}
 	}
 	progress.Printf("done: %d; failed: %d", len(scenes)-failed, failed)
 	if failed > 0 {
@@ -109,12 +157,12 @@ func main() {
 	}
 }
 
-func search(ctx context.Context, c *http.Client, bbox, from, to, direction, orbit string, limit int) ([]scene, error) {
+func search(ctx context.Context, c *http.Client, bbox, from, to, dir, orbit string, limit int, sel map[string]bool) ([]scene, error) {
 	v := strings.Split(bbox, ",")
 	if len(v) != 4 {
 		return nil, fmt.Errorf("bbox must be west,south,east,north")
 	}
-	p := [4]float64{}
+	var p [4]float64
 	for i := range v {
 		x, err := strconv.ParseFloat(strings.TrimSpace(v[i]), 64)
 		if err != nil {
@@ -128,7 +176,7 @@ func search(ctx context.Context, c *http.Client, bbox, from, to, direction, orbi
 	wkt := fmt.Sprintf("polygon((%f %f,%f %f,%f %f,%f %f,%f %f))", p[0], p[1], p[2], p[1], p[2], p[3], p[0], p[3], p[0], p[1])
 	u, _ := url.Parse(api)
 	q := u.Query()
-	q.Set("platform", "Sentinel-1A,Sentinel-1B")
+	q.Set("platform", "Sentinel-1A,Sentinel-1B,Sentinel-1C")
 	q.Set("beamMode", "IW")
 	q.Set("processingLevel", "GRD_HD")
 	q.Set("polarization", "VV,VV+VH")
@@ -137,13 +185,14 @@ func search(ctx context.Context, c *http.Client, bbox, from, to, direction, orbi
 	q.Set("end", to)
 	q.Set("output", "geojson")
 	q.Set("maxResults", strconv.Itoa(limit))
-	if direction != "" {
-		q.Set("flightDirection", strings.ToUpper(direction))
+	if dir != "" {
+		q.Set("flightDirection", dir)
 	}
 	if orbit != "" {
 		q.Set("relativeOrbit", orbit)
 	}
 	u.RawQuery = q.Encode()
+
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	resp, err := c.Do(req)
 	if err != nil {
@@ -168,55 +217,124 @@ func search(ctx context.Context, c *http.Client, bbox, from, to, direction, orbi
 		if name == "" {
 			name = strings.TrimSuffix(filepath.Base(pr.FileName), filepath.Ext(pr.FileName))
 		}
-		if name == "" {
-			name = strings.TrimSuffix(filepath.Base(pr.URL), filepath.Ext(pr.URL))
-		}
 		name = safe(name)
-		if !seen[name] {
-			seen[name] = true
-			scenes = append(scenes, scene{name, pr.URL})
+		if seen[name] || (len(sel) > 0 && !sel[name]) {
+			continue
 		}
+		seen[name] = true
+		ts, _ := time.Parse(time.RFC3339, pr.StartTime)
+		date := pr.StartTime
+		if len(date) >= 10 {
+			date = date[:10]
+		}
+		sz, _ := pr.Bytes.Int64()
+		scenes = append(scenes, scene{
+			name: name, url: pr.URL, date: date, dir: pr.FlightDirection,
+			orbit: pr.PathNumber.String(), pols: pr.Polarization, ts: ts, bytes: sz,
+		})
 	}
+	sort.Slice(scenes, func(i, j int) bool { return scenes[i].ts.Before(scenes[j].ts) })
 	return scenes, nil
 }
 
-func process(ctx context.Context, c *http.Client, s scene, out string, progress *progressDisplay) error {
-	tifPath := filepath.Join(out, "tif", s.name+"_VV.tiff")
-	pgmPath := filepath.Join(out, "pgm", s.name+"_VV.pgm")
-	if exists(tifPath) && exists(pgmPath) {
+func printCatalog(w io.Writer, scenes []scene) {
+	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(tw, "DATE\tORBIT\tDIRECTION\tPOLS\tMB\tSCENE")
+	tracks := map[string]int{}
+	for _, s := range scenes {
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%.0f\t%s\n",
+			s.date, s.orbit, s.dir, s.pols, float64(s.bytes)/(1024*1024), s.name)
+		tracks[fmt.Sprintf("-orbit %s -direction %s", s.orbit, s.dir)]++
+	}
+	_ = tw.Flush()
+	var keys []string
+	for k := range tracks {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		fmt.Fprintf(os.Stderr, "track: %-32s (%d scenes)\n", k, tracks[k])
+	}
+}
+
+func fetchScene(ctx context.Context, c *http.Client, s scene, outDir, rawDir string, pols []string, progress *progressDisplay) ([]string, error) {
+	targets := make(map[string]string, len(pols))
+	var missing []string
+	var allPaths []string
+	for _, pol := range pols {
+		p := filepath.Join(outDir, fmt.Sprintf("%s_%s.tiff", s.name, strings.ToUpper(pol)))
+		targets[pol] = p
+		allPaths = append(allPaths, p)
+		if !exists(p) {
+			missing = append(missing, pol)
+		}
+	}
+	if len(missing) == 0 {
 		progress.Printf("skip %s", shortName(s.name))
-		return nil
+		return allPaths, nil
 	}
-	if !exists(tifPath) {
-		zipPath := filepath.Join(out, "raw", s.name+".zip")
-		if !progress.interactive {
-			progress.Printf("get %s", shortName(s.name))
-		}
-		if err := download(ctx, c, s.url, zipPath, s.name, progress); err != nil {
-			return err
-		}
-		if !progress.interactive {
-			progress.Printf("got %s", shortName(s.name))
-		}
-		progress.Printf("extract %s", shortName(s.name))
-		if err := extractVV(zipPath, tifPath); err != nil {
-			return err
-		}
-		_ = os.Remove(zipPath)
+
+	zipPath := filepath.Join(rawDir, s.name+".zip")
+	if !progress.interactive {
+		progress.Printf("get %s", shortName(s.name))
 	}
-	if exists(pgmPath) {
-		progress.Printf("skip convert %s (PGM exists)", shortName(s.name))
-		return nil
+	if err := download(ctx, c, s.url, zipPath, s.name, progress); err != nil {
+		return nil, err
 	}
-	tmp := pgmPath + ".part"
-	progress.Printf("convert %s", shortName(s.name))
-	cmd := exec.Command("gdal_translate", "-q", "-of", "PNM", "-ot", "UInt16", "-co", "MAXVAL=65535", tifPath, tmp)
-	if b, err := cmd.CombinedOutput(); err != nil {
-		_ = os.Remove(tmp)
-		return fmt.Errorf("gdal_translate: %w: %s", err, b)
+	defer os.Remove(zipPath)
+	progress.Printf("extract %s (%s)", shortName(s.name), strings.ToUpper(strings.Join(missing, ",")))
+	if err := extractBands(zipPath, targets, missing); err != nil {
+		return nil, err
 	}
-	if err := os.Rename(tmp, pgmPath); err != nil {
+	return allPaths, nil
+}
+
+func extractBands(zipPath string, targets map[string]string, pols []string) error {
+	z, err := zip.OpenReader(zipPath)
+	if err != nil {
 		return err
+	}
+	defer z.Close()
+	for _, pol := range pols {
+		tag := "-" + pol + "-"
+		var band *zip.File
+		for _, f := range z.File {
+			n := strings.ToLower(filepath.Base(f.Name))
+			if (strings.HasSuffix(n, ".tif") || strings.HasSuffix(n, ".tiff")) &&
+				strings.Contains(n, tag) && !strings.Contains(f.Name, "preview") {
+				if band != nil {
+					return fmt.Errorf("multiple %s TIFFs in archive", strings.ToUpper(pol))
+				}
+				band = f
+			}
+		}
+		if band == nil {
+			return fmt.Errorf("no %s measurement TIFF in archive", strings.ToUpper(pol))
+		}
+		r, err := band.Open()
+		if err != nil {
+			return err
+		}
+		dst := targets[pol]
+		tmp := dst + ".part"
+		w, err := os.Create(tmp)
+		if err != nil {
+			_ = r.Close()
+			return err
+		}
+		_, cp := io.Copy(w, r)
+		_ = r.Close()
+		cl := w.Close()
+		if cp != nil || cl != nil {
+			_ = os.Remove(tmp)
+			if cp != nil {
+				return cp
+			}
+			return cl
+		}
+		if err := os.Rename(tmp, dst); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -252,61 +370,64 @@ func download(ctx context.Context, c *http.Client, src, dst, name string, progre
 	_, cp := io.Copy(f, progressReader{reader: resp.Body, progress: progress, name: name})
 	progress.finish(name)
 	cl := f.Close()
-	if cp != nil {
+	if cp != nil || cl != nil {
 		_ = os.Remove(tmp)
-		return cp
-	}
-	if cl != nil {
-		_ = os.Remove(tmp)
+		if cp != nil {
+			return cp
+		}
 		return cl
 	}
 	return os.Rename(tmp, dst)
 }
 
-func extractVV(src, dst string) error {
-	z, err := zip.OpenReader(src)
-	if err != nil {
-		return err
-	}
-	defer z.Close()
-	var band *zip.File
-	for _, f := range z.File {
-		n := strings.ToLower(filepath.Base(f.Name))
-		if (strings.HasSuffix(n, ".tif") || strings.HasSuffix(n, ".tiff")) && strings.Contains(n, "-vv-") {
-			if band != nil {
-				return fmt.Errorf("multiple VV measurement TIFFs in archive")
-			}
-			band = f
+func parsePols(s string) ([]string, error) {
+	var pols []string
+	seen := map[string]bool{}
+	for _, p := range strings.Split(strings.ToLower(s), ",") {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		if p != "vv" && p != "vh" {
+			return nil, fmt.Errorf("invalid polarization %q (expected vv, vh, or vv,vh)", p)
+		}
+		if !seen[p] {
+			seen[p] = true
+			pols = append(pols, p)
 		}
 	}
-	if band == nil {
-		return fmt.Errorf("no VV measurement TIFF in SAFE archive")
+	if len(pols) == 0 {
+		return nil, fmt.Errorf("at least one polarization required")
 	}
-	r, err := band.Open()
-	if err != nil {
-		return err
-	}
-	defer r.Close()
-	tmp := dst + ".part"
-	w, err := os.Create(tmp)
-	if err != nil {
-		return err
-	}
-	_, cp := io.Copy(w, r)
-	cl := w.Close()
-	if cp != nil {
-		_ = os.Remove(tmp)
-		return cp
-	}
-	if cl != nil {
-		_ = os.Remove(tmp)
-		return cl
-	}
-	return os.Rename(tmp, dst)
+	return pols, nil
 }
 
-func earthdataClient() *http.Client {
-	if os.Getenv("EARTHDATA_TOKEN") == "" && (os.Getenv("EARTHDATA_USERNAME") == "" || os.Getenv("EARTHDATA_PASSWORD") == "") {
+func parseSelected(s string) (map[string]bool, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil, nil
+	}
+	sel := map[string]bool{}
+	if s == "-" {
+		sc := bufio.NewScanner(os.Stdin)
+		for sc.Scan() {
+			fields := strings.Fields(sc.Text())
+			if len(fields) > 0 && fields[0] != "DATE" && !strings.HasPrefix(fields[0], "#") {
+				sel[safe(fields[len(fields)-1])] = true
+			}
+		}
+		return sel, sc.Err()
+	}
+	for _, tok := range strings.Split(s, ",") {
+		if tok = strings.TrimSpace(tok); tok != "" {
+			sel[safe(tok)] = true
+		}
+	}
+	return sel, nil
+}
+
+func earthdataClient(listOnly bool) *http.Client {
+	if !listOnly && os.Getenv("EARTHDATA_TOKEN") == "" && (os.Getenv("EARTHDATA_USERNAME") == "" || os.Getenv("EARTHDATA_PASSWORD") == "") {
 		log.Fatal("set EARTHDATA_TOKEN or EARTHDATA_USERNAME and EARTHDATA_PASSWORD")
 	}
 	jar, _ := cookiejar.New(nil)
@@ -320,18 +441,22 @@ func earthdataClient() *http.Client {
 		return nil
 	}}
 }
+
 func auth(r *http.Request) {
 	if t := os.Getenv("EARTHDATA_TOKEN"); t != "" {
 		r.Header.Set("Authorization", "Bearer "+t)
-	} else {
-		r.SetBasicAuth(os.Getenv("EARTHDATA_USERNAME"), os.Getenv("EARTHDATA_PASSWORD"))
+	} else if u := os.Getenv("EARTHDATA_USERNAME"); u != "" {
+		r.SetBasicAuth(u, os.Getenv("EARTHDATA_PASSWORD"))
 	}
 }
+
 func trusted(h string) bool {
 	h = strings.ToLower(h)
 	return h == "urs.earthdata.nasa.gov" || strings.HasSuffix(h, ".asf.alaska.edu")
 }
+
 func exists(p string) bool { s, e := os.Stat(p); return e == nil && s.Size() > 0 }
+
 func safe(s string) string {
 	return strings.Map(func(r rune) rune {
 		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || strings.ContainsRune("-_.", r) {
@@ -342,9 +467,8 @@ func safe(s string) string {
 }
 
 type downloadProgress struct {
-	name     string
-	received int64
-	total    int64
+	name            string
+	received, total int64
 }
 
 type progressDisplay struct {
@@ -366,10 +490,7 @@ func newProgressDisplay(out io.Writer) *progressDisplay {
 }
 
 func (p *progressDisplay) Printf(format string, args ...any) {
-	line := fmt.Sprintf(format, args...)
-	line = strings.ReplaceAll(line, "\r", " ")
-	line = strings.ReplaceAll(line, "\n", " ")
-
+	line := strings.NewReplacer("\r", " ", "\n", " ").Replace(fmt.Sprintf(format, args...))
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.clearLocked()
@@ -428,20 +549,17 @@ func (p *progressDisplay) finish(name string) {
 }
 
 func (p *progressDisplay) clearLocked() {
-	if !p.interactive || p.drawn == 0 {
-		return
+	if p.interactive && p.drawn > 0 {
+		fmt.Fprintf(p.out, "\033[%dA\r\033[J", p.drawn)
+		p.drawn = 0
 	}
-	fmt.Fprintf(p.out, "\033[%dA\r\033[J", p.drawn)
-	p.drawn = 0
 }
 
 func (p *progressDisplay) drawLocked() {
 	if !p.interactive {
 		return
 	}
-	if p.drawn > 0 {
-		fmt.Fprintf(p.out, "\033[%dA\r\033[J", p.drawn)
-	}
+	p.clearLocked()
 	names := make([]string, 0, len(p.active))
 	for name := range p.active {
 		names = append(names, name)
@@ -458,23 +576,16 @@ func (p *progressDisplay) progressLine(item *downloadProgress) string {
 	if item.total <= 0 {
 		return fmt.Sprintf("get %s %s MiB", name, mib(item.received))
 	}
-	pct := int(float64(item.received) * 100 / float64(item.total))
-	if pct > 100 {
-		pct = 100
-	}
-	const width = 20
-	filled := pct * width / 100
-	bar := strings.Repeat("#", filled) + strings.Repeat(".", width-filled)
+	pct := min(100, int(float64(item.received)*100/float64(item.total)))
+	filled := pct * 20 / 100
+	bar := strings.Repeat("#", filled) + strings.Repeat(".", 20-filled)
 	return fmt.Sprintf("get %s [%s] %3d%% %s/%s MiB", name, bar, pct, mib(item.received), mib(item.total))
 }
 
-func mib(n int64) string {
-	return fmt.Sprintf("%.0f", float64(n)/(1024*1024))
-}
+func mib(n int64) string { return fmt.Sprintf("%.0f", float64(n)/(1024*1024)) }
 
 func shortName(name string) string {
-	const maxLength = 22
-	if len(name) <= maxLength {
+	if len(name) <= 22 {
 		return name
 	}
 	return name[:9] + "..." + name[len(name)-10:]
