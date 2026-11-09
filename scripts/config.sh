@@ -3,7 +3,8 @@
 
 # 1. Geographic Area & ASF Search Parameters
 #BBOX="-3.25,55.90,-3.10,55.98"   # west,south,east,north (Firth of Forth example)
-BBOX="-1.8979,53.5223,-1.5566,53.6939"
+#BBOX="-1.8979,53.5223,-1.5566,53.6939"
+BBOX="-2.7356,53.7390,-0.4120,54.5466"
 FROM="2026-01-01"
 TO="2026-04-01"
 DIRECTION="ASCENDING"            # ASCENDING or DESCENDING (keep consistent!)
@@ -14,13 +15,14 @@ DOWNLOAD_LIMIT=8                  # Maximum number of scenes returned for downlo
 # 2. Resolution & Alignment
 SCOUT_RES=100                    # Coarse meters/pixel to inspect full 250km swath (~2 MB PNG)
 ALIGN_RES=10                     # Fine meters/pixel for AOI co-registration
+FULL_PCA_RES="${FULL_PCA_RES:-$ALIGN_RES}" # Full-scene PCA resolution; defaults to aligned scene resolution
 MIN_COV="0.80"                   # Allow scenes that cover at least 80% of the BBOX
 PGM_BITS=8                       # 8-bit halves PGM size after sarimg's p2-p98 stretch
 CHIP_SIZE=0                      # 0 = full BBOX; or e.g. 1024 for NxN chips
 
 # 3. Siam Training & Inference
 STEPS=10000
-LR=0.1
+LR=0.01
 STRIDE=8
 FALSE_ALARM="1e-6"
 OVERLAY_THRESH="0.15"

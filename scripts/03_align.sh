@@ -23,7 +23,7 @@ echo "==> Opening aligned AOI PNGs for visual verification..."
 open_files "$DATA_DIR"/png/*.png
 
 echo ""
-read -r -p "Are the aligned PNGs properly cropped? Delete raw full-swath .tiff files now to save disk space? [y/N] " ans
+read -r -p "Are the aligned PNGs properly cropped? Delete raw full-swath .tiff files now? Full-scene PCA in 05_infer.sh needs them. [y/N] " ans
 if [[ "$ans" =~ ^[yY] ]]; then
     rm -f "$DATA_DIR"/*.tiff "$DATA_DIR"/*.tif
     rm -rf "$SCOUT_DIR"
