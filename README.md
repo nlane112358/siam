@@ -25,6 +25,7 @@ NAME
 
 SYNOPSIS
     siam [options] PRE POST
+    siam -M STATE [options] FRAME
     siam -t [options] [PRE POST]...
     siam -e [options] [PRE POST]...
     siam -h
@@ -33,7 +34,8 @@ DESCRIPTION
     PRE and POST are P2 or P5 PGM images (8-bit or 16-bit) with matching
     dimensions of at least 32x32 pixels. Training and evaluation accept
     image pairs as operands, from a pair list (-L FILE), or from standard
-    input (-). Each pair-list entry is PRE POST.
+    input (-). Each pair-list entry is PRE POST. With `-M`, `FRAME` is one
+    current image scored against and added to the saved temporal state.
 
 OPTIONS
     -h              display help and exit
@@ -44,14 +46,17 @@ OPTIONS
     -u              upsample the inference map to input dimensions
     -w FILE         weights file [siam.w]
     -L FILE         read image pairs from FILE; '-' means standard input
-    -o FILE         write the inference map to FILE; '-' means standard output
+    -o FILE         write residual-innovation distance map; '-' means standard output
     -v FILE         write POST tile embeddings as a PCA false-color P6 PPM; '-' means stdout
+    -k FILE         write selected scale per tile as PGM (4, 8, 16, 32 cells)
+    -m FILE         write motion field as an HSV false-color P6 PPM
     -D FILE         write anomalous backscatter-drop tiles to FILE
     -I FILE         write anomalous backscatter-increase tiles to FILE
     -n STEPS        training steps [200]
     -l RATE         learning rate [0.01]
     -S SEED         random seed [time and process ID]
     -p VALUE        image false-alarm probability for inference [1e-6]
+    -M FILE         read and update per-tile vMF state; FRAME is one image
     -a VALUE        evaluation cosine-distance threshold [0.35]
     -f VALUE        evaluation alert fraction threshold [0.05]
     -s PIXELS       sliding-window stride [8]
@@ -73,6 +78,13 @@ EXAMPLES
 Train with a Barlow Twins cross-correlation objective across multiple
 `<pre.pgm> <post.pgm>` pairs via positional arguments, `-L <list.txt>`, or
 streamed from `stdin` (`-`):
+
+For each batch of paired views, the 32 embedding dimensions are standardized
+across the batch and compared with a 32×32 cross-correlation matrix. Training
+pushes its diagonal toward 1 and penalizes off-diagonal correlations with
+`λ = 0.005`. The objective uses paired views without sample-to-sample negative
+pairs, avoiding false-negative pressure when different patches have similar
+background appearance.
 
 ```sh
 paste <(find pgm_floods -name '*_pre.pgm' | sort | head -n 300) \
@@ -104,17 +116,55 @@ Follows POSIX `diff(1)` / `cmp(1)` exit conventions (`0` = normal, `1` = anomaly
 ./siam -w flood.w -p 1e-6 pre.pgm post.pgm > change_map.pgm || notify_alert
 ```
 
+To save the aligned displacement field alongside the innovation map:
+
+```sh
+./siam -w flood.w -p 1e-6 -o innovation.pgm -m motion.ppm pre.pgm post.pgm
+```
+
 Inference computes motion-aligned embedding residuals, estimates their scene mean
 and covariance, and whitens them with the shared 32-dimensional Jacobi spectral
 decomposition. A Wilson–Hilferty approximation maps each Mahalanobis distance to
 a chi-square tail probability. `-p` is the target image-level false-alarm rate;
-the detector uses a Bonferroni per-tile cutoff (`-p / tile_count`) and alerts if
-any tile crosses it. The output map stores `1 − tile_p`, so brighter values mean
-more anomalous tiles. This calibration is approximate: it assumes approximately
+the detector uses a Bonferroni cutoff across tile and scale comparisons
+(`-p / (tile_count × active_scales)`) and alerts if any tile-scale score crosses
+it. Each tile takes the scale with the smallest p-value. The output map stores
+the cosine distance after sub-pixel alignment, so brighter values show larger
+residual innovations. This calibration is approximate: it assumes approximately
 Gaussian residuals, while the scene mean and covariance are estimated from the
 same image being scored and the local motion match selects the best candidate.
 The status line also reports 8-connected significant-tile blobs and the largest
 blob area in tiles.
+
+The full four-level SAT path applies when `-s` is divisible by four. Other stride
+values retain the patch-aligned 8-cell level, since their convolution windows do
+not share the scene-wide SAT grid alignment.
+
+Pass `-k scales.pgm` to save the winning scale at every tile. Gray levels encode
+the 4, 8, 16, and 32 SAT-cell windows as 0, 85, 170, and 255. `-u` upsamples this
+map with the anomaly maps.
+
+Pass `-m motion.ppm` to save the selected local displacement field. Hue shows
+direction, brightness shows magnitude, and vectors are scaled to input pixels.
+Motion is estimated from the 8-cell meso embeddings and reused across pyramid
+levels. The PPM uses one pixel per tile; `-u` upsamples it to input dimensions.
+
+For a continuous sequence, pass one frame per invocation with `-M scene.state`:
+
+```sh
+./siam -M scene.state -w flood.w -p 1e-6 frame_001.pgm
+./siam -M scene.state -w flood.w -p 1e-6 frame_002.pgm
+```
+
+The first frame initializes the state and produces no alert. Later frames are
+scored against each tile's vMF direction before updating it with a 0.99 forgetting
+factor. The update lets stable tiles build concentration and reduces concentration
+when directions vary: it updates the natural vector as `η' = 0.99κμ + u`, then
+sets `μ' = η'/||η'||` and `κ' = ||η'||`. The state file stores a 32-value fp16 direction plus an
+fp16 concentration per tile (66 bytes), with a small geometry/version header.
+Reuse requires the same scene grid, image dimensions, and stride. Stateful
+significance uses `2κ(1 − μ·u)` with a Wilson–Hilferty χ²(31) tail approximation
+and the image-level `-p` cutoff corrected across tiles.
 
 To split anomalous tiles by backscatter direction, request both directional maps:
 
@@ -124,10 +174,11 @@ To split anomalous tiles by backscatter direction, request both directional maps
   pre.pgm post.pgm
 ```
 
-Each 32×32 window is assigned to the drop or increase map when its tile p-value
-meets the image-adjusted `-p` cutoff and its mean `POST−PRE` pixel difference is
-negative or positive, respectively. The map retains the `1 − tile_p` score for
-those tiles and zeros the rest. `-u` upsamples all three outputs. This is a directional gate: on
+Each tile is assigned to the drop or increase map when its selected
+tile-scale p-value meets the image-adjusted `-p` cutoff and its mean `POST−PRE`
+pixel difference is negative or positive, respectively. The maps retain the
+cosine innovation distance for those tiles and zero the rest. `-u` upsamples all
+requested maps. This is a directional gate: on
 calibrated dB inputs, the sign corresponds to ΔdB; on linear backscatter inputs,
 the sign of each pixel difference corresponds to the sign of its dB change. Use
 the same calibration and intensity scaling for both images. Independently

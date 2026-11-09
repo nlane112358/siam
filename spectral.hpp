@@ -128,11 +128,15 @@ struct SpectralDecomposition {
         return static_cast<float>(dist_sq);
     }
 
-    static float chi2_to_zscore(float d_sq) noexcept {
-        constexpr float k = static_cast<float>(Config::EMBED_D);
-        constexpr float var = 2.0f / (9.0f * k);
+    static float chi2_to_zscore(float d_sq, float degrees_of_freedom) noexcept {
+        const float k = std::max(1.0f, degrees_of_freedom);
+        const float var = 2.0f / (9.0f * k);
         const float cube_root = std::cbrt(std::max(0.0f, d_sq / k));
         return (cube_root - (1.0f - var)) / std::sqrt(var);
+    }
+
+    static float chi2_to_zscore(float d_sq) noexcept {
+        return chi2_to_zscore(d_sq, static_cast<float>(Config::EMBED_D));
     }
 };
 

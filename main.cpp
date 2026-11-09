@@ -28,6 +28,7 @@ static void usage(FILE* out) {
         "\n"
         "SYNOPSIS\n"
         "    siam [options] PRE POST\n"
+        "    siam -M STATE [options] FRAME\n"
         "    siam -t [options] [PRE POST]...\n"
         "    siam -e [options] [PRE POST]...\n"
         "    siam -h\n"
@@ -36,7 +37,8 @@ static void usage(FILE* out) {
         "    PRE and POST are P2 or P5 PGM images (8-bit or 16-bit) with matching\n"
         "    dimensions of at least 32x32 pixels. Training and evaluation accept\n"
         "    image pairs as operands, from a pair list (-L FILE), or from standard\n"
-        "    input (-). Each pair-list entry is PRE POST.\n"
+        "    input (-). Each pair-list entry is PRE POST. With -M, FRAME is a single\n"
+        "    current image scored against and added to the saved temporal state.\n"
         "\n"
         "OPTIONS\n"
         "    -h              display help and exit\n"
@@ -47,14 +49,17 @@ static void usage(FILE* out) {
         "    -u              upsample the inference map to input dimensions\n"
         "    -w FILE         weights file [siam.w]\n"
         "    -L FILE         read image pairs from FILE; '-' means standard input\n"
-        "    -o FILE         write the inference map to FILE; '-' means standard output\n"
+        "    -o FILE         write residual-innovation distance map; '-' means stdout\n"
         "    -v FILE         write POST tile embeddings as a PCA false-color P6 PPM; '-' means stdout\n"
+        "    -k FILE         write selected scale per tile as PGM (4, 8, 16, 32 cells)\n"
+        "    -m FILE         write motion field as an HSV false-color P6 PPM\n"
         "    -D FILE         write anomalous backscatter-drop tiles to FILE\n"
         "    -I FILE         write anomalous backscatter-increase tiles to FILE\n"
         "    -n STEPS        training steps [200]\n"
         "    -l RATE         learning rate [0.01]\n"
         "    -S SEED         random seed [time and process ID]\n"
         "    -p VALUE        image false-alarm probability for inference [1e-6]\n"
+        "    -M FILE         read and update per-tile vMF state; FRAME is one image\n"
         "    -a VALUE        evaluation cosine-distance threshold [0.35]\n"
         "    -f VALUE        evaluation alert fraction threshold [0.05]\n"
         "    -s PIXELS       sliding-window stride [8]\n"
@@ -80,12 +85,14 @@ int main(int argc, char** argv) {
     float lr = 0.01f, tile_thresh = 0.35f, alert_frac = 0.05f;
     double false_alarm_prob = 1e-6;
     uint32_t seed = static_cast<uint32_t>(std::time(nullptr)) ^ static_cast<uint32_t>(getpid());
-    std::string weights_path = "siam.w", list_path, out_path = "-", embedding_map_path;
+    std::string weights_path = "siam.w", list_path, out_path = "-", embedding_map_path,
+                scale_map_path, motion_map_path, state_path;
     std::string drop_path, increase_path;
-    bool embedding_map_requested = false;
+    bool embedding_map_requested = false, scale_map_requested = false, motion_map_requested = false;
+    bool state_requested = false;
     bool p_requested = false, p_parse_valid = true, eval_threshold_requested = false;
     int opt;
-    while ((opt = getopt(argc, argv, "tecquv:w:L:o:D:I:n:l:a:f:p:s:S:h")) != -1) {
+    while ((opt = getopt(argc, argv, "tecquv:k:m:M:w:L:o:D:I:n:l:a:f:p:s:S:h")) != -1) {
         switch (opt) {
             case 't': train_mode = true; break;
             case 'e': eval_mode = true; break;
@@ -93,6 +100,9 @@ int main(int argc, char** argv) {
             case 'u': upsample = true; break;
             case 'q': quiet = true; break;
             case 'v': embedding_map_path = optarg; embedding_map_requested = true; break;
+            case 'k': scale_map_path = optarg; scale_map_requested = true; break;
+            case 'm': motion_map_path = optarg; motion_map_requested = true; break;
+            case 'M': state_path = optarg; state_requested = true; break;
             case 'w': weights_path = optarg; break;
             case 'L': list_path = optarg; break;
             case 'o': out_path = optarg; break;
@@ -120,13 +130,25 @@ int main(int argc, char** argv) {
         !std::isfinite(false_alarm_prob) || false_alarm_prob <= 0.0 || false_alarm_prob >= 1.0 ||
         (p_requested && !p_parse_valid) ||
         (p_requested && (train_mode || eval_mode)) ||
+        (state_requested && (state_path.empty() || state_path == "-" || train_mode || eval_mode ||
+            state_path == weights_path || !list_path.empty() || continue_weights || directional || embedding_map_requested ||
+            scale_map_requested || motion_map_requested)) ||
         (eval_threshold_requested && !eval_mode) ||
         (drop_path.empty() != increase_path.empty()) ||
         (directional && (train_mode || eval_mode || drop_path == "-" || increase_path == "-")) ||
         (directional && (drop_path == increase_path || drop_path == out_path || increase_path == out_path)) ||
         (embedding_map_requested && (embedding_map_path.empty() || train_mode || eval_mode ||
             embedding_map_path == out_path ||
-            (directional && (embedding_map_path == drop_path || embedding_map_path == increase_path))))) {
+            (directional && (embedding_map_path == drop_path || embedding_map_path == increase_path)))) ||
+        (scale_map_requested && (scale_map_path.empty() || train_mode || eval_mode ||
+            scale_map_path == out_path ||
+            (embedding_map_requested && scale_map_path == embedding_map_path) ||
+            (directional && (scale_map_path == drop_path || scale_map_path == increase_path)))) ||
+        (motion_map_requested && (motion_map_path.empty() || train_mode || eval_mode ||
+            motion_map_path == out_path ||
+            (embedding_map_requested && motion_map_path == embedding_map_path) ||
+            (scale_map_requested && motion_map_path == scale_map_path) ||
+            (directional && (motion_map_path == drop_path || motion_map_path == increase_path))))) {
         usage(stderr); return EXIT_TROUBLE;
     }
     try {
@@ -150,6 +172,20 @@ int main(int argc, char** argv) {
             detector.evaluate(pairs, stride, tile_thresh, alert_frac);
             return EXIT_NORMAL;
         }
+        if (state_requested) {
+            if (argc - optind != 1 || state_path == out_path || state_path == argv[optind] ||
+                (out_path != "-" && out_path == argv[optind])) {
+                usage(stderr); return EXIT_TROUBLE;
+            }
+            PgmImage frame = PgmImage::load(argv[optind]);
+            if (frame.width() < Config::PATCH_S || frame.height() < Config::PATCH_S)
+                throw std::runtime_error("siam: stream frame is smaller than the patch size");
+            encoder.load_weights(weights_path);
+            ChangeDetector detector(encoder);
+            const bool is_alert = detector.infer_stream(frame, stride, false_alarm_prob,
+                                                        upsample, out_path, state_path, quiet);
+            return is_alert ? EXIT_ALERT : EXIT_NORMAL;
+        }
         if (!list_path.empty() || (argc - optind) != 2) {
             usage(stderr); return EXIT_TROUBLE;
         }
@@ -159,7 +195,8 @@ int main(int argc, char** argv) {
         ChangeDetector detector(encoder);
         const bool is_alert = detector.infer(pairs[0], stride, false_alarm_prob,
                                              upsample, out_path, drop_path, increase_path,
-                                             embedding_map_path, quiet);
+                                             embedding_map_path, scale_map_path,
+                                             motion_map_path, quiet);
         return is_alert ? EXIT_ALERT : EXIT_NORMAL;
     } catch (const std::exception& ex) {
         std::fprintf(stderr, "%s\n", ex.what());
