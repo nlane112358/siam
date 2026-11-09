@@ -3,10 +3,11 @@
 set -euo pipefail
 source "$(dirname "$0")/config.sh"
 
-echo "==> Co-registering scenes to BBOX=$BBOX at ${ALIGN_RES}m resolution..."
+echo "==> Co-registering scenes to BBOX=$BBOX at ${ALIGN_RES}m resolution (min-cov=$MIN_COV)..."
 sarimg \
     -bbox "$BBOX" \
     -res "$ALIGN_RES" \
+    -min-cov "$MIN_COV" \
     -bits "$PGM_BITS" \
     -chip "$CHIP_SIZE" \
     -to pgm,png \

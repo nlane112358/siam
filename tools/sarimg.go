@@ -244,17 +244,24 @@ func loadRaster(src string, isTif, stretch bool, cfg config) (*raster, float64, 
 	var cmd *exec.Cmd
 	if cfg.bbox != nil {
 		epsg, minX, minY, maxX, maxY := utmGrid(*cfg.bbox, cfg.res)
+		tmpTif := tmpPgm + ".tif"
+		defer os.Remove(tmpTif)
+
 		cmd = exec.Command("gdalwarp", "-q", "-overwrite", "-tps",
 			"-t_srs", epsg,
 			"-te", fmt.Sprintf("%.3f", minX), fmt.Sprintf("%.3f", minY), fmt.Sprintf("%.3f", maxX), fmt.Sprintf("%.3f", maxY),
 			"-tr", fmt.Sprintf("%.3f", cfg.res), fmt.Sprintf("%.3f", cfg.res),
 			"-r", "bilinear", "-srcnodata", "0", "-dstnodata", "0",
-			"-ot", "UInt16", "-of", "PNM", "-co", "MAXVAL=65535", src, tmpPgm)
+			"-ot", "UInt16", "-of", "GTiff", src, tmpTif)
+		if b, err := cmd.CombinedOutput(); err != nil {
+			return nil, 0, 0, 0, fmt.Errorf("gdalwarp: %w: %s", err, b)
+		}
+		cmd = exec.Command("gdal_translate", "-q", "-of", "PNM", "-ot", "UInt16", "-co", "MAXVAL=65535", tmpTif, tmpPgm)
 	} else {
 		cmd = exec.Command("gdal_translate", "-q", "-of", "PNM", "-ot", "UInt16", "-co", "MAXVAL=65535", src, tmpPgm)
 	}
 	if b, err := cmd.CombinedOutput(); err != nil {
-		return nil, 0, 0, 0, fmt.Errorf("gdal: %w: %s", err, b)
+		return nil, 0, 0, 0, fmt.Errorf("gdal_translate: %w: %s", err, b)
 	}
 	f, err := os.Open(tmpPgm)
 	if err != nil {

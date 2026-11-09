@@ -217,6 +217,12 @@ These exploratory panels show full-scene Sentinel-1 inputs and model distance ma
 
 The utilities in `tools/` are `asf.go`, which searches and downloads Sentinel-1 scenes from ASF DAAC, and `sarimg.go`, which converts, aligns, and chips SAR imagery and builds chronological training pairs.
 
+### Coverage scout map
+
+![Sentinel-1 scene coverage and area of interest over the UK](docs/sentinel1-coverage-scout.png)
+
+This locator view layers full-scene Sentinel-1 scout images over an optical basemap. The grayscale shows SAR backscatter; dark wedges are no-data areas inside the rectangular image overlays. Cyan dashed rectangles show each TIFF's geographic bounding box, derived from its ground control points, rather than the precise valid-pixel footprint. The gold rectangle marks the configured `BBOX` area of interest used for the ASF search and common-grid alignment. In `scripts/01_locate.sh`, Shift-drag on the map to select a different area.
+
 ### Build and requirements
 
 From the project root, build `siam` and both Go utilities:

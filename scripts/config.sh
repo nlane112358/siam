@@ -9,17 +9,18 @@ TO="2026-04-01"
 DIRECTION="ASCENDING"            # ASCENDING or DESCENDING (keep consistent!)
 ORBIT="132"                         # Leave empty on first scout; set to lock track
 POL="vv"                         # vv, vh, or vv,vh
-DOWNLOAD_LIMIT=2                  # Maximum number of scenes returned for download
+DOWNLOAD_LIMIT=8                  # Maximum number of scenes returned for download
 
 # 2. Resolution & Alignment
 SCOUT_RES=100                    # Coarse meters/pixel to inspect full 250km swath (~2 MB PNG)
 ALIGN_RES=10                     # Fine meters/pixel for AOI co-registration
+MIN_COV="0.80"                   # Allow scenes that cover at least 80% of the BBOX
 PGM_BITS=8                       # 8-bit halves PGM size after sarimg's p2-p98 stretch
 CHIP_SIZE=0                      # 0 = full BBOX; or e.g. 1024 for NxN chips
 
 # 3. Siam Training & Inference
-STEPS=200
-LR=0.01
+STEPS=10000
+LR=0.1
 STRIDE=8
 FALSE_ALARM="1e-6"
 OVERLAY_THRESH="0.15"

@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -24,6 +25,8 @@ import (
 )
 
 const api = "https://api.daac.asf.alaska.edu/services/search/param"
+
+var errEarthdataUnauthorized = errors.New("Earthdata authentication failed")
 
 type result struct {
 	Features []struct {
@@ -119,16 +122,31 @@ func main() {
 	}
 	jobs := make(chan int, len(scenes))
 	results := make(chan outcome, len(scenes))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var authFailureOnce sync.Once
 	var wg sync.WaitGroup
 	for i := 0; i < *workers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for idx := range jobs {
+				if ctx.Err() != nil {
+					results <- outcome{idx: idx, err: context.Canceled}
+					continue
+				}
 				s := scenes[idx]
-				paths, err := fetchScene(context.Background(), client, s, *out, rawDir, pols, progress)
+				paths, err := fetchScene(ctx, client, s, *out, rawDir, pols, progress)
 				if err != nil {
-					progress.Printf("fail %s: %v", shortName(s.name), err)
+					if errors.Is(err, errEarthdataUnauthorized) {
+						authFailureOnce.Do(func() {
+							cancel()
+							progress.Printf("fail %s: %v", shortName(s.name), err)
+							progress.Printf("stopping remaining downloads after Earthdata authentication failure")
+						})
+					} else if !errors.Is(err, context.Canceled) {
+						progress.Printf("fail %s: %v", shortName(s.name), err)
+					}
 				}
 				results <- outcome{idx: idx, paths: paths, err: err}
 			}
@@ -364,6 +382,9 @@ func download(ctx context.Context, c *http.Client, src, dst, name string, progre
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
 		progress.finish(name)
+		if resp.StatusCode == http.StatusUnauthorized {
+			return fmt.Errorf("%w: download %s: %s", errEarthdataUnauthorized, resp.Status, strings.TrimSpace(string(b)))
+		}
 		return fmt.Errorf("download %s: %s", resp.Status, b)
 	}
 	f, err := os.Create(tmp)
