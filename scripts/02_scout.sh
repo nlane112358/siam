@@ -3,15 +3,19 @@
 set -euo pipefail
 source "$(dirname "$0")/config.sh"
 
-SCOUT_BBOX="${TRAIN_BBOX:-$BBOX}"
-ASF_ARGS=(-bbox "$SCOUT_BBOX" -from "$FROM" -to "$TO" -pol "$POL" -limit "$DOWNLOAD_LIMIT" -out "$DATA_DIR")
+if [[ -n "${SEED_POINT:-}" ]]; then
+    ASF_ARGS=(-point "$SEED_POINT" -save-bbox "$DATA_DIR/auto_bbox.txt" -from "$FROM" -to "$TO" -pol "$POL" -limit "$DOWNLOAD_LIMIT" -out "$DATA_DIR" -workers "${ASF_WORKERS:-6}")
+else
+    SCOUT_BBOX="${TRAIN_BBOX:-$BBOX}"
+    ASF_ARGS=(-bbox "$SCOUT_BBOX" -from "$FROM" -to "$TO" -pol "$POL" -limit "$DOWNLOAD_LIMIT" -out "$DATA_DIR" -workers "${ASF_WORKERS:-6}")
+fi
 [[ -n "$DIRECTION" ]] && ASF_ARGS+=(-direction "$DIRECTION")
 [[ -n "$ORBIT" ]]     && ASF_ARGS+=(-orbit "$ORBIT")
 
 echo "==> [1/3] Catalog of up to $DOWNLOAD_LIMIT matching Sentinel-1 scene(s) on NASA ASF:"
 asf -ls "${ASF_ARGS[@]}"
 
-if [[ -z "$ORBIT" ]]; then
+if [[ -z "$ORBIT" && -z "${SEED_POINT:-}" ]]; then
     echo ""
     echo "NOTE: Set ORBIT in config.sh to one of the track numbers above so all scenes share the same look angle."
     read -r -p "Continue downloading all listed tracks anyway? [y/N] " ans

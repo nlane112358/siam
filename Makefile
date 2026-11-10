@@ -30,11 +30,11 @@ HEADERS = config.hpp image.hpp network.hpp trainer.hpp detector.hpp dataset.hpp
 $(TARGET): $(SOURCES) $(HEADERS) | bin
 	$(CXX) $(CXXFLAGS) $< -o $@ $(LDFLAGS)
 
-bin/asf: tools/asf.go | bin
-	$(GO) build -o $@ $<
+bin/asf: tools/asf.go tools/geom.go | bin
+	$(GO) build -o $@ $^
 
-bin/sarimg: tools/sarimg.go | bin
-	$(GO) build -o $@ $<
+bin/sarimg: tools/sarimg.go tools/geom.go | bin
+	$(GO) build -o $@ $^
 
 bin:
 	mkdir -p $@

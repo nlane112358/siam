@@ -61,7 +61,12 @@ func main() {
 	log.SetFlags(0)
 	var cfg config
 	toFlag := flag.String("to", "auto", "output format(s): pgm, png, or pgm,png (auto: pgm for TIFF when -pairs, else png)")
-	bboxFlag := flag.String("bbox", "", "west,south,east,north: warp TIFFs to a shared UTM grid")
+	bboxFlag := flag.String("bbox", "", "west,south,east,north or 'auto': warp TIFFs to a shared UTM grid")
+	autoBBoxFlag := flag.Bool("auto-bbox", false, "automatically compute maximum aligned BBOX from input TIFFs")
+	findBBoxFlag := flag.Bool("find-bbox", false, "print maximum aligned BBOX to stdout and exit")
+	pointFlag := flag.String("point", "", "seed coordinate: lon,lat for auto-bbox alignment")
+	minOverlapFlag := flag.Float64("min-overlap", 0.70, "minimum mutual overlap fraction with consensus polygon (0..1)")
+	seedMarginFlag := flag.Float64("seed-margin", 5.0, "minimum distance in km from seed point to TIFF edge")
 	flag.StringVar(&cfg.out, "o", "/Users/nlane/Development/siam/data", "output directory, file path, or '-' for stdout")
 	flag.Float64Var(&cfg.res, "res", 10.0, "target pixel resolution in meters when -bbox is set")
 	flag.Float64Var(&cfg.minCov, "min-cov", 0.0, "minimum nonzero pixel fraction [0..1] (default 0.90 if -bbox/-chip)")
@@ -87,11 +92,20 @@ func main() {
 	if cfg.bits != 8 && cfg.bits != 16 {
 		log.Fatal("bits must be 8 or 16")
 	}
-	if cfg.bbox, _ = parseBBox(*bboxFlag); *bboxFlag != "" && cfg.bbox == nil {
-		log.Fatal("bbox must be valid west,south,east,north")
+
+	var seedPt *Point
+	if *pointFlag != "" {
+		var err error
+		seedPt, err = parseSeedPoint(*pointFlag)
+		if err != nil {
+			log.Fatalf("point: %v", err)
+		}
 	}
-	if cfg.minCov == 0.0 && (cfg.bbox != nil || cfg.chip > 0) {
-		cfg.minCov = 0.90
+
+	if *bboxFlag != "auto" {
+		if cfg.bbox, _ = parseBBox(*bboxFlag); *bboxFlag != "" && cfg.bbox == nil {
+			log.Fatal("bbox must be valid west,south,east,north or 'auto'")
+		}
 	}
 
 	if cfg.baseImg != "" {
@@ -104,6 +118,23 @@ func main() {
 	inputs, err := collectInputs(flag.Args())
 	if err != nil || len(inputs) == 0 {
 		log.Fatalf("no valid input files found (%v)", err)
+	}
+
+	if *findBBoxFlag || *autoBBoxFlag || *bboxFlag == "auto" {
+		allocBBox, accepted, err := autoAllocateBBox(inputs, seedPt, *seedMarginFlag, *minOverlapFlag)
+		if err != nil {
+			log.Fatalf("auto-bbox: %v", err)
+		}
+		if *findBBoxFlag {
+			fmt.Printf("%.4f,%.4f,%.4f,%.4f\n", allocBBox[0], allocBBox[1], allocBBox[2], allocBBox[3])
+			return
+		}
+		cfg.bbox = allocBBox
+		inputs = accepted
+	}
+
+	if cfg.minCov == 0.0 && (cfg.bbox != nil || cfg.chip > 0) {
+		cfg.minCov = 0.90
 	}
 	cfg.formats = resolveFormats(*toFlag, inputs, cfg.pairs)
 
@@ -774,38 +805,136 @@ func percentile(hist []uint64, count uint64, p float64) float64 {
 	return float64(loBin) + float64(hiBin-loBin)*(pos-float64(lo))
 }
 
-func utmGrid(b [4]float64, res float64) (string, float64, float64, float64, float64) {
-	lonC, latC := 0.5*(b[0]+b[2]), 0.5*(b[1]+b[3])
-	zone := min(60, max(1, int(math.Floor((lonC+180)/6))+1))
-	epsg := 32600 + zone
-	if latC < 0 {
-		epsg = 32700 + zone
-	}
-	x1, y1 := toUTM(b[0], b[1], zone, latC < 0)
-	x2, y2 := toUTM(b[2], b[3], zone, latC < 0)
-	return fmt.Sprintf("EPSG:%d", epsg),
-		math.Floor(math.Min(x1, x2)/res) * res, math.Floor(math.Min(y1, y2)/res) * res,
-		math.Ceil(math.Max(x1, x2)/res) * res, math.Ceil(math.Max(y1, y2)/res) * res
+type tiffCandidate struct {
+	path     string
+	poly     Polygon
+	utm      Polygon
+	margin   float64
+	accepted bool
+	reason   string
 }
 
-func toUTM(lon, lat float64, zone int, south bool) (float64, float64) {
-	const a, f, k0 = 6378137.0, 1.0 / 298.257223563, 0.9996
-	e2 := f * (2 - f)
-	ep2 := e2 / (1 - e2)
-	latR, lonR := lat*math.Pi/180, lon*math.Pi/180
-	lon0R := float64((zone-1)*6-177) * math.Pi / 180
-	s, c, t := math.Sin(latR), math.Cos(latR), math.Tan(latR)
-	n := a / math.Sqrt(1-e2*s*s)
-	T, C, A := t*t, ep2*c*c, c*(lonR-lon0R)
-	e4, e6 := e2*e2, e2*e2*e2
-	m := a * ((1-e2/4-3*e4/64-5*e6/256)*latR - (3*e2/8+3*e4/32+45*e6/1024)*math.Sin(2*latR) +
-		(15*e4/256+45*e6/1024)*math.Sin(4*latR) - (35*e6/3072)*math.Sin(6*latR))
-	x := k0*n*(A+(1-T+C)*math.Pow(A, 3)/6+(5-18*T+T*T+72*C-58*ep2)*math.Pow(A, 5)/120) + 500000
-	y := k0 * (m + n*t*(A*A/2+(5-T+9*C+4*C*C)*math.Pow(A, 4)/24+(61-58*T+T*T+600*C-330*ep2)*math.Pow(A, 6)/720))
-	if south {
-		y += 10000000
+func autoAllocateBBox(inputs []string, seedPt *Point, seedMarginKm, minOverlap float64) (*[4]float64, []string, error) {
+	var candidates []*tiffCandidate
+	for _, in := range inputs {
+		ext := strings.ToLower(filepath.Ext(in))
+		if ext != ".tif" && ext != ".tiff" {
+			continue
+		}
+		poly, err := extractTiffFootprint(in)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warn %s: %v\n", filepath.Base(in), err)
+			continue
+		}
+		candidates = append(candidates, &tiffCandidate{
+			path:     in,
+			poly:     poly,
+			accepted: true,
+		})
 	}
-	return x, y
+
+	if len(candidates) == 0 {
+		return nil, nil, fmt.Errorf("no valid GeoTIFF footprints found in input files")
+	}
+
+	var refLon, refLat float64
+	if seedPt != nil {
+		refLon, refLat = seedPt.X, seedPt.Y
+	} else {
+		refLon, refLat = candidates[0].poly[0].X, candidates[0].poly[0].Y
+	}
+	zone, south := utmZone(refLon, refLat)
+
+	for _, c := range candidates {
+		c.utm = projectPolygonToUTM(c.poly, zone, south)
+		if seedPt != nil {
+			if !pointInPolygon(*seedPt, c.poly) {
+				c.accepted = false
+				c.reason = "does not cover seed point"
+				continue
+			}
+			margin := pointToPolygonDistKm(*seedPt, c.poly, zone, south)
+			c.margin = margin
+			if margin < seedMarginKm {
+				c.accepted = false
+				c.reason = fmt.Sprintf("seed too close to edge (%.1fkm < %.1fkm)", margin, seedMarginKm)
+				continue
+			}
+		} else {
+			c.margin = polygonArea(c.utm)
+		}
+	}
+
+	var active []*tiffCandidate
+	for _, c := range candidates {
+		if c.accepted {
+			active = append(active, c)
+		}
+	}
+
+	if len(active) == 0 {
+		return nil, nil, fmt.Errorf("no TIFFs passed seed point/margin checks")
+	}
+
+	sort.Slice(active, func(i, j int) bool {
+		return active[i].margin > active[j].margin
+	})
+
+	pCore := active[0].utm
+	for _, c := range active[1:] {
+		clipped := clipPolygon(pCore, c.utm)
+		clippedArea := polygonArea(clipped)
+		coreArea := polygonArea(pCore)
+		var ratio float64
+		if coreArea > 0 {
+			ratio = clippedArea / coreArea
+		}
+
+		if ratio < minOverlap {
+			c.accepted = false
+			c.reason = fmt.Sprintf("low mutual overlap (%.1f%% < %.1f%%)", ratio*100, minOverlap*100)
+		} else {
+			pCore = clipped
+		}
+	}
+
+	fmt.Fprintf(os.Stderr, "==> Footprint alignment analysis across %d TIFF(s):\n", len(candidates))
+	var acceptedPaths []string
+	for _, c := range candidates {
+		stem := filepath.Base(c.path)
+		if c.accepted {
+			fmt.Fprintf(os.Stderr, "    [ACCEPTED] %s\n", stem)
+			acceptedPaths = append(acceptedPaths, c.path)
+		} else {
+			fmt.Fprintf(os.Stderr, "    [REJECTED] %s: %s\n", stem, c.reason)
+		}
+	}
+
+	if len(acceptedPaths) == 0 {
+		return nil, nil, fmt.Errorf("no TIFFs accepted after footprint overlap filtering")
+	}
+
+	var seedUTM *Point
+	if seedPt != nil {
+		ux, uy := toUTM(seedPt.X, seedPt.Y, zone, south)
+		seedUTM = &Point{X: ux, Y: uy}
+	}
+
+	minX, minY, maxX, maxY, ok := maxInscribedBox(pCore, seedUTM, 250, 250)
+	if !ok {
+		return nil, nil, fmt.Errorf("failed to calculate maximum inscribed rectangle")
+	}
+
+	minLon, minLat := fromUTM(minX, minY, zone, south)
+	maxLon, maxLat := fromUTM(maxX, maxY, zone, south)
+	bbox := [4]float64{minLon, minLat, maxLon, maxLat}
+
+	commonAreaKm2 := polygonArea(pCore) / 1e6
+	boxAreaKm2 := ((maxX - minX) * (maxY - minY)) / 1e6
+	fmt.Fprintf(os.Stderr, "==> Common overlap: %.1f km², Max inscribed box: %.1f km²\n", commonAreaKm2, boxAreaKm2)
+	fmt.Fprintf(os.Stderr, "==> BBOX: %.4f,%.4f,%.4f,%.4f\n", minLon, minLat, maxLon, maxLat)
+
+	return &bbox, acceptedPaths, nil
 }
 
 func inferno(t float64) color.RGBA {

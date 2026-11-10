@@ -2,6 +2,10 @@
 # config.sh — Shared configuration for the siam workflow
 
 # 1. Geographic Area & ASF Search Parameters
+# Optional seed coordinate (lon, lat) to auto-discover scenes and allocate maximum aligned BBOX:
+# e.g., SEED_POINT="31.2357,30.0444"
+SEED_POINT="${SEED_POINT:-}"
+
 # Target ROI for local calibration & evaluation:
 #ROI_BBOX="-22.65,63.80,-22.10,64.05"
 #ROI_BBOX="2.5296,50.9653,5.7101,52.2614"
@@ -18,6 +22,7 @@ DIRECTION="ASCENDING"            # ASCENDING or DESCENDING (keep consistent!)
 ORBIT=""                         # Leave empty on first scout; set to lock track
 POL="vv"                         # vv, vh, or vv,vh
 DOWNLOAD_LIMIT=15                  # Maximum number of scenes returned for download
+ASF_WORKERS=6                      # Concurrent ASF scene downloads (tune up/down based on bandwidth)
 
 # 2. Resolution & Alignment
 SCOUT_RES=100                    # Coarse meters/pixel to inspect full 250km swath (~2 MB PNG)

@@ -30,6 +30,10 @@ var errEarthdataUnauthorized = errors.New("Earthdata authentication failed")
 
 type result struct {
 	Features []struct {
+		Geometry struct {
+			Type        string         `json:"type"`
+			Coordinates [][][2]float64 `json:"coordinates"`
+		} `json:"geometry"`
 		Properties struct {
 			URL             string      `json:"url"`
 			FileName        string      `json:"fileName"`
@@ -47,12 +51,20 @@ type scene struct {
 	name, url, date, dir, orbit, pols string
 	ts                                time.Time
 	bytes                             int64
+	poly                              Polygon // lon/lat polygon
+	accepted                          bool
+	rejectReason                      string
 }
 
 func main() {
 	log.SetFlags(0)
 	progress := newProgressDisplay(os.Stderr)
-	bbox := flag.String("bbox", "", "west,south,east,north (required)")
+	bbox := flag.String("bbox", "", "west,south,east,north")
+	pointFlag := flag.String("point", "", "seed coordinate: lon,lat to discover scenes and allocate aligned BBOX")
+	seedMargin := flag.Float64("seed-margin", 5.0, "minimum distance in km from seed point to scene edge")
+	minOverlap := flag.Float64("min-overlap", 0.70, "minimum mutual overlap fraction with consensus polygon (0..1)")
+	autoOrbit := flag.Bool("auto-orbit", true, "automatically select dominant orbit track when -point is used")
+	saveBBox := flag.String("save-bbox", "", "optional path to save the calculated maximum aligned BBOX")
 	from := flag.String("from", "", "start date YYYY-MM-DD (required)")
 	to := flag.String("to", "", "end date YYYY-MM-DD (required)")
 	out := flag.String("out", "/Users/nlane/Development/siam/data", "output directory for extracted TIFFs")
@@ -61,13 +73,23 @@ func main() {
 	polFlag := flag.String("pol", "vv,vh", "polarizations to extract: vv, vh, or vv,vh")
 	scenesFlag := flag.String("scenes", "", "comma-separated scene names, or '-' to read from stdin")
 	listOnly := flag.Bool("ls", false, "list available scenes to stdout without downloading")
-	workers := flag.Int("workers", 3, "concurrent downloads")
+	workers := flag.Int("workers", 6, "concurrent downloads")
 	limit := flag.Int("limit", 100, "maximum search results")
 	flag.Parse()
 
-	if *bbox == "" || *from == "" || *to == "" || *workers < 1 || *limit < 1 {
+	var seedPt *Point
+	var err error
+	if *pointFlag != "" {
+		seedPt, err = parseSeedPoint(*pointFlag)
+		if err != nil {
+			log.Fatalf("point: %v", err)
+		}
+		progress.Printf("seed: lon=%.4f, lat=%.4f", seedPt.X, seedPt.Y)
+	}
+
+	if (*bbox == "" && seedPt == nil) || *from == "" || *to == "" || *workers < 1 || *limit < 1 {
 		flag.Usage()
-		log.Fatal("bbox, dates, workers, and limit are required")
+		log.Fatal("either -bbox or -point, and from, to, workers, and limit are required")
 	}
 	if _, err := time.Parse("2006-01-02", *from); err != nil {
 		log.Fatalf("from: %v", err)
@@ -95,7 +117,7 @@ func main() {
 
 	client := earthdataClient(*listOnly)
 	progress.Printf("search: ASF")
-	scenes, err := search(context.Background(), client, *bbox, *from, *to, dir, *orbit, *limit, selected)
+	scenes, err := search(context.Background(), client, *bbox, seedPt, *from, *to, dir, *orbit, *limit, selected)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -103,10 +125,32 @@ func main() {
 	if len(scenes) == 0 {
 		return
 	}
+
+	autoBBoxStr := ""
+	scenes, autoBBoxStr = analyzeAndFilterScenes(scenes, seedPt, *orbit, *autoOrbit, *seedMargin, *minOverlap)
+
+	if *saveBBox != "" && autoBBoxStr != "" {
+		if err := os.WriteFile(*saveBBox, []byte(autoBBoxStr+"\n"), 0o644); err != nil {
+			log.Fatalf("save-bbox: %v", err)
+		}
+		fmt.Fprintf(os.Stderr, "==> Saved BBOX to %s\n", *saveBBox)
+	}
+
 	if *listOnly {
-		printCatalog(os.Stdout, scenes)
+		printCatalog(os.Stdout, scenes, autoBBoxStr)
 		return
 	}
+
+	var toDownload []scene
+	for _, s := range scenes {
+		if s.accepted {
+			toDownload = append(toDownload, s)
+		}
+	}
+	if len(toDownload) == 0 {
+		log.Fatal("no scenes accepted for download after footprint filtering")
+	}
+	scenes = toDownload
 
 	rawDir := filepath.Join(*out, ".raw")
 	for _, d := range []string{*out, rawDir} {
@@ -180,23 +224,28 @@ func main() {
 	}
 }
 
-func search(ctx context.Context, c *http.Client, bbox, from, to, dir, orbit string, limit int, sel map[string]bool) ([]scene, error) {
-	v := strings.Split(bbox, ",")
-	if len(v) != 4 {
-		return nil, fmt.Errorf("bbox must be west,south,east,north")
-	}
-	var p [4]float64
-	for i := range v {
-		x, err := strconv.ParseFloat(strings.TrimSpace(v[i]), 64)
-		if err != nil {
-			return nil, fmt.Errorf("invalid bbox: %w", err)
+func search(ctx context.Context, c *http.Client, bbox string, seedPt *Point, from, to, dir, orbit string, limit int, sel map[string]bool) ([]scene, error) {
+	var wkt string
+	if seedPt != nil {
+		wkt = fmt.Sprintf("point(%f %f)", seedPt.X, seedPt.Y)
+	} else {
+		v := strings.Split(bbox, ",")
+		if len(v) != 4 {
+			return nil, fmt.Errorf("bbox must be west,south,east,north")
 		}
-		p[i] = x
+		var p [4]float64
+		for i := range v {
+			x, err := strconv.ParseFloat(strings.TrimSpace(v[i]), 64)
+			if err != nil {
+				return nil, fmt.Errorf("invalid bbox: %w", err)
+			}
+			p[i] = x
+		}
+		if p[0] < -180 || p[2] > 180 || p[1] < -90 || p[3] > 90 || p[0] >= p[2] || p[1] >= p[3] {
+			return nil, fmt.Errorf("invalid bbox coordinates")
+		}
+		wkt = fmt.Sprintf("polygon((%f %f,%f %f,%f %f,%f %f,%f %f))", p[0], p[1], p[2], p[1], p[2], p[3], p[0], p[3], p[0], p[1])
 	}
-	if p[0] < -180 || p[2] > 180 || p[1] < -90 || p[3] > 90 || p[0] >= p[2] || p[1] >= p[3] {
-		return nil, fmt.Errorf("invalid bbox coordinates")
-	}
-	wkt := fmt.Sprintf("polygon((%f %f,%f %f,%f %f,%f %f,%f %f))", p[0], p[1], p[2], p[1], p[2], p[3], p[0], p[3], p[0], p[1])
 	u, _ := url.Parse(api)
 	q := u.Query()
 	q.Set("platform", "Sentinel-1A,Sentinel-1B,Sentinel-1C")
@@ -251,32 +300,186 @@ func search(ctx context.Context, c *http.Client, bbox, from, to, dir, orbit stri
 			date = date[:10]
 		}
 		sz, _ := pr.Bytes.Int64()
+
+		var poly Polygon
+		if f.Geometry.Type == "Polygon" && len(f.Geometry.Coordinates) > 0 {
+			ring := f.Geometry.Coordinates[0]
+			if len(ring) > 3 && ring[0] == ring[len(ring)-1] {
+				ring = ring[:len(ring)-1]
+			}
+			for _, pt := range ring {
+				poly = append(poly, Point{X: pt[0], Y: pt[1]})
+			}
+			poly = ensureCCW(poly)
+		}
+
 		scenes = append(scenes, scene{
 			name: name, url: pr.URL, date: date, dir: pr.FlightDirection,
 			orbit: pr.PathNumber.String(), pols: pr.Polarization, ts: ts, bytes: sz,
+			poly: poly, accepted: true,
 		})
 	}
 	sort.Slice(scenes, func(i, j int) bool { return scenes[i].ts.Before(scenes[j].ts) })
 	return scenes, nil
 }
 
-func printCatalog(w io.Writer, scenes []scene) {
+func analyzeAndFilterScenes(scenes []scene, seedPt *Point, requestedOrbit string, autoOrbit bool, seedMarginKm, minOverlap float64) ([]scene, string) {
+	if len(scenes) == 0 {
+		return scenes, ""
+	}
+
+	targetOrbit := requestedOrbit
+	if seedPt != nil && targetOrbit == "" && autoOrbit {
+		trackCounts := map[string]int{}
+		for _, s := range scenes {
+			k := s.orbit + "_" + s.dir
+			trackCounts[k]++
+		}
+		bestTrack, maxCount := "", 0
+		for k, count := range trackCounts {
+			if count > maxCount {
+				maxCount = count
+				bestTrack = k
+			}
+		}
+		if bestTrack != "" {
+			parts := strings.Split(bestTrack, "_")
+			targetOrbit = parts[0]
+			fmt.Fprintf(os.Stderr, "==> Auto-selected dominant track: orbit %s (%s) with %d scene(s)\n", parts[0], parts[1], maxCount)
+		}
+	}
+
+	var refLon, refLat float64
+	if seedPt != nil {
+		refLon, refLat = seedPt.X, seedPt.Y
+	} else if len(scenes[0].poly) > 0 {
+		refLon, refLat = scenes[0].poly[0].X, scenes[0].poly[0].Y
+	}
+	zone, south := utmZone(refLon, refLat)
+
+	type cand struct {
+		idx    int
+		utm    Polygon
+		margin float64
+	}
+	var candidates []cand
+
+	for i := range scenes {
+		scenes[i].accepted = true
+
+		if targetOrbit != "" && scenes[i].orbit != targetOrbit {
+			scenes[i].accepted = false
+			scenes[i].rejectReason = fmt.Sprintf("not on target orbit %s", targetOrbit)
+			continue
+		}
+
+		if len(scenes[i].poly) < 3 {
+			scenes[i].accepted = false
+			scenes[i].rejectReason = "missing geometry polygon"
+			continue
+		}
+
+		utmPoly := projectPolygonToUTM(scenes[i].poly, zone, south)
+
+		if seedPt != nil {
+			if !pointInPolygon(*seedPt, scenes[i].poly) {
+				scenes[i].accepted = false
+				scenes[i].rejectReason = "does not cover seed point"
+				continue
+			}
+
+			margin := pointToPolygonDistKm(*seedPt, scenes[i].poly, zone, south)
+			if margin < seedMarginKm {
+				scenes[i].accepted = false
+				scenes[i].rejectReason = fmt.Sprintf("seed too close to edge (%.1fkm < %.1fkm)", margin, seedMarginKm)
+				continue
+			}
+
+			candidates = append(candidates, cand{idx: i, utm: utmPoly, margin: margin})
+		} else {
+			candidates = append(candidates, cand{idx: i, utm: utmPoly, margin: polygonArea(utmPoly)})
+		}
+	}
+
+	if len(candidates) == 0 {
+		return scenes, ""
+	}
+
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].margin > candidates[j].margin
+	})
+
+	pCore := candidates[0].utm
+	for _, c := range candidates[1:] {
+		clipped := clipPolygon(pCore, c.utm)
+		clippedArea := polygonArea(clipped)
+		coreArea := polygonArea(pCore)
+		var ratio float64
+		if coreArea > 0 {
+			ratio = clippedArea / coreArea
+		}
+
+		if ratio < minOverlap {
+			scenes[c.idx].accepted = false
+			scenes[c.idx].rejectReason = fmt.Sprintf("low mutual overlap (%.1f%% < %.1f%%)", ratio*100, minOverlap*100)
+		} else {
+			pCore = clipped
+		}
+	}
+
+	var seedUTM *Point
+	if seedPt != nil {
+		ux, uy := toUTM(seedPt.X, seedPt.Y, zone, south)
+		seedUTM = &Point{X: ux, Y: uy}
+	}
+
+	minX, minY, maxX, maxY, ok := maxInscribedBox(pCore, seedUTM, 250, 250)
+	if !ok {
+		return scenes, ""
+	}
+
+	minLon, minLat := fromUTM(minX, minY, zone, south)
+	maxLon, maxLat := fromUTM(maxX, maxY, zone, south)
+	autoBBox := fmt.Sprintf("%.4f,%.4f,%.4f,%.4f", minLon, minLat, maxLon, maxLat)
+
+	commonAreaKm2 := polygonArea(pCore) / 1e6
+	boxAreaKm2 := ((maxX - minX) * (maxY - minY)) / 1e6
+
+	accCount := 0
+	for _, s := range scenes {
+		if s.accepted {
+			accCount++
+		}
+	}
+
+	fmt.Fprintf(os.Stderr, "==> Footprint analysis: %d/%d accepted scene(s)\n", accCount, len(scenes))
+	fmt.Fprintf(os.Stderr, "    Common overlap: %.1f km², Max inscribed box: %.1f km²\n", commonAreaKm2, boxAreaKm2)
+	fmt.Fprintf(os.Stderr, "    BBOX: %s\n", autoBBox)
+
+	return scenes, autoBBox
+}
+
+func printCatalog(w io.Writer, scenes []scene, autoBBox string) {
 	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(tw, "DATE\tORBIT\tDIRECTION\tPOLS\tMB\tSCENE")
+	fmt.Fprintln(tw, "DATE\tORBIT\tDIR\tPOLS\tMB\tSTATUS\tSCENE")
 	tracks := map[string]int{}
 	for _, s := range scenes {
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%.0f\t%s\n",
-			s.date, s.orbit, s.dir, s.pols, float64(s.bytes)/(1024*1024), s.name)
-		tracks[fmt.Sprintf("-orbit %s -direction %s", s.orbit, s.dir)]++
+		status := "ACCEPTED"
+		if !s.accepted {
+			status = "REJECTED (" + s.rejectReason + ")"
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%.0f\t%s\t%s\n",
+			s.date, s.orbit, s.dir, s.pols, float64(s.bytes)/(1024*1024), status, s.name)
+		if s.accepted {
+			tracks[fmt.Sprintf("-orbit %s -direction %s", s.orbit, s.dir)]++
+		}
 	}
 	_ = tw.Flush()
-	var keys []string
-	for k := range tracks {
-		keys = append(keys, k)
+	if autoBBox != "" {
+		fmt.Fprintf(os.Stderr, "\n==> Maximum aligned BBOX: %s\n", autoBBox)
 	}
-	sort.Strings(keys)
-	for _, k := range keys {
-		fmt.Fprintf(os.Stderr, "track: %-32s (%d scenes)\n", k, tracks[k])
+	for k, count := range tracks {
+		fmt.Fprintf(os.Stderr, "track: %-32s (%d accepted scene(s))\n", k, count)
 	}
 }
 
@@ -457,15 +660,21 @@ func earthdataClient(listOnly bool) *http.Client {
 		log.Fatal("set EARTHDATA_TOKEN or EARTHDATA_USERNAME and EARTHDATA_PASSWORD")
 	}
 	jar, _ := cookiejar.New(nil)
-	return &http.Client{Jar: jar, CheckRedirect: func(r *http.Request, via []*http.Request) error {
-		if trusted(r.URL.Hostname()) {
-			auth(r)
-		}
-		if len(via) >= 10 {
-			return fmt.Errorf("too many redirects")
-		}
-		return nil
-	}}
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.MaxIdleConnsPerHost = 16
+	return &http.Client{
+		Transport: tr,
+		Jar:       jar,
+		CheckRedirect: func(r *http.Request, via []*http.Request) error {
+			if trusted(r.URL.Hostname()) {
+				auth(r)
+			}
+			if len(via) >= 10 {
+				return fmt.Errorf("too many redirects")
+			}
+			return nil
+		},
+	}
 }
 
 // loadEarthdataEnv reads a local .env without overriding values already set by

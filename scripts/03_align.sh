@@ -3,6 +3,25 @@
 set -euo pipefail
 source "$(dirname "$0")/config.sh"
 
+if [[ -f "$DATA_DIR/auto_bbox.txt" ]]; then
+    AUTO_VAL="$(cat "$DATA_DIR/auto_bbox.txt" | tr -d '[:space:]')"
+    if [[ -n "$AUTO_VAL" ]]; then
+        TRAIN_BBOX="$AUTO_VAL"
+        echo "==> Using auto-allocated maximum aligned BBOX=$TRAIN_BBOX (from $DATA_DIR/auto_bbox.txt)"
+    fi
+elif [[ -n "${SEED_POINT:-}" ]]; then
+    shopt -s nullglob
+    TIFS=("$DATA_DIR"/*.tiff "$DATA_DIR"/*.tif)
+    shopt -u nullglob
+    if [[ ${#TIFS[@]} -gt 0 ]]; then
+        AUTO_VAL="$(sarimg -find-bbox -point "$SEED_POINT" "${TIFS[@]}" 2>/dev/null || true)"
+        if [[ -n "$AUTO_VAL" ]]; then
+            TRAIN_BBOX="$AUTO_VAL"
+            echo "==> Auto-allocated maximum aligned BBOX=$TRAIN_BBOX for SEED_POINT=$SEED_POINT"
+        fi
+    fi
+fi
+
 echo "==> Co-registering scenes to TRAIN_BBOX=$TRAIN_BBOX at ${ALIGN_RES}m (chip=${CHIP_SIZE}px, min-cov=$MIN_COV)..."
 sarimg \
     -bbox "$TRAIN_BBOX" \

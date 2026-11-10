@@ -252,9 +252,15 @@ Both Go programs use the standard library. For TIFF input, `sarimg` needs GDAL `
 
 ### Search and download scenes
 
-Use a west,south,east,north bounding box and ISO dates. This search lists matching scenes without downloading them, so Earthdata credentials are not needed:
+You can search using either an explicit bounding box (`-bbox="west,south,east,north"`) or a single anchor point (`-point="lon,lat"`). When `-point` is provided, `asf` queries NASA ASF for scenes covering that location, auto-detects the dominant repeat orbit track, prunes fringe scenes (where the point is within `-seed-margin` km of the swath edge) and bottleneck scenes with low mutual overlap (`-min-overlap=0.70`), and calculates the maximum inscribed bounding box (100% valid data) across all accepted scenes.
+
+This search lists matching scenes without downloading them, so Earthdata credentials are not needed:
 
 ```sh
+# Search by seed coordinate (e.g. Cairo) with auto-orbit and auto-bbox calculation:
+./bin/asf -point="31.2357,30.0444" -from=2024-04-01 -to=2024-05-01 -ls
+
+# Or search by explicit bounding box:
 ./bin/asf -bbox="-5.5,49.9,1.8,53.5" -from=2025-05-01 -to=2025-10-01 \
   -orbit=35 -direction=DESCENDING -pol=vv -ls
 ```
@@ -265,15 +271,19 @@ For downloads, copy `.env.example` to `.env` and set either `EARTHDATA_TOKEN` or
 [ -f .env ] || cp .env.example .env
 chmod 600 .env
 # Edit .env and add your Earthdata token or username and password.
-./bin/asf -bbox="-5.5,49.9,1.8,53.5" -from=2025-05-01 -to=2025-10-01 \
-  -orbit=35 -direction=DESCENDING -pol=vv -out=../data/england/tif \
-  | ./bin/sarimg -bbox="-5.5,49.9,1.8,53.5" -res=10 \
-      -o ../data/england -to=pgm,png -chip=1024 -min-cov=0.85
+
+# 1. Download accepted scenes and save auto-calculated BBOX:
+./bin/asf -point="31.2357,30.0444" -from=2024-04-01 -to=2024-05-01 \
+  -pol=vv -save-bbox=data/auto_bbox.txt -out=data
+
+# 2. Or let sarimg automatically compute the maximum aligned box and warp:
+./bin/sarimg -auto-bbox -point="31.2357,30.0444" -res=10 \
+  -chip=256 -min-cov=0.90 -to=pgm,png -pairs -o data data/*.tiff > data/pairs.txt
 ```
 
 The example writes TIFFs to `data/england/tif`, 16-bit PGM chips to `data/england/pgm`, and display PNG chips to `data/england/png`. TIFF inputs receive a nonzero-pixel p2-p98 stretch by default. `-bbox` aligns scenes to a shared UTM grid; `-res` sets its pixel size in metres. `-chip` sets the square chip size, while `-min-cov` filters chips by their fraction of nonzero pixels. Set the dates, bounding box, orbit, direction, polarization, and output directory for your area. Pass `-out` to `asf` and `-o` to `sarimg` to choose output paths.
 
-Use `asf -h` and `sarimg -h` for all options. `asf -ls` prints a scene catalog; `-scenes` can restrict a download to comma-separated scene names. The default polarization selection is `vv,vh`; downloads use three workers by default.
+Use `asf -h` and `sarimg -h` for all options. `asf -ls` prints a scene catalog; `-scenes` can restrict a download to comma-separated scene names. The default polarization selection is `vv,vh`; downloads use six workers by default (configurable via `-workers` or `ASF_WORKERS` in `scripts/config.sh`).
 
 ### Create pairs and train
 
