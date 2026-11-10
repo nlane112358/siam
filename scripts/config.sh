@@ -2,16 +2,22 @@
 # config.sh — Shared configuration for the siam workflow
 
 # 1. Geographic Area & ASF Search Parameters
-#BBOX="-3.25,55.90,-3.10,55.98"   # west,south,east,north (Firth of Forth example)
-#BBOX="-1.8979,53.5223,-1.5566,53.6939"
-#BBOX="-2.7356,53.7390,-0.4120,54.5466"
-BBOX="-22.65,63.80,-22.10,64.05"
-FROM="2023-10-01"
-TO="2024-03-01"
+# Target ROI for local calibration & evaluation:
+#ROI_BBOX="-22.65,63.80,-22.10,64.05"
+#ROI_BBOX="2.5296,50.9653,5.7101,52.2614"
+ROI_BBOX="28.3887,21.3610,33.9148,32.0826"
+BBOX="$ROI_BBOX"
+
+# Broader regional training footprint (can be larger than ROI for geographical diversity):
+TRAIN_BBOX="${TRAIN_BBOX:-$ROI_BBOX}"
+#TRAIN_BBOX="-22.65,63.80,-22.10,64.05"
+
+FROM="2023-05-01"
+TO="2024-05-01"
 DIRECTION="ASCENDING"            # ASCENDING or DESCENDING (keep consistent!)
 ORBIT=""                         # Leave empty on first scout; set to lock track
 POL="vv"                         # vv, vh, or vv,vh
-DOWNLOAD_LIMIT=10                  # Maximum number of scenes returned for download
+DOWNLOAD_LIMIT=15                  # Maximum number of scenes returned for download
 
 # 2. Resolution & Alignment
 SCOUT_RES=100                    # Coarse meters/pixel to inspect full 250km swath (~2 MB PNG)
@@ -19,15 +25,17 @@ ALIGN_RES=10                     # Fine meters/pixel for AOI co-registration
 FULL_PCA_RES="${FULL_PCA_RES:-$ALIGN_RES}" # Full-scene PCA resolution; defaults to aligned scene resolution
 MIN_COV="0.70"                   # Allow scenes that cover at least 70% of the BBOX
 PGM_BITS=8                       # 8-bit halves PGM size after sarimg's p2-p98 stretch
-CHIP_SIZE=0                      # 0 = full BBOX; or e.g. 1024 for NxN chips
+CHIP_SIZE=256                    # Moderate tiles (256-512 px square) as storage units
 
 # 3. Siam Training & Inference
 STEPS=10000
 LR=0.01
 STRIDE=8
-TILE_THRESH="0.35"
+STABILITY_THRESH="0.20"          # Temporal backscatter stability threshold for positive patches
+CALIB_P_FA="0.005"               # Target false alarm probability P_fa for ROI calibration (0.5%)
+TILE_THRESH="0.35"               # Default tile threshold (overridden if calib_thresh.txt exists)
 ALERT_FRAC="0.05"
-OVERLAY_THRESH="0.15"
+CHANGE_MAP_THRESH="${CHANGE_MAP_THRESH:-$TILE_THRESH}"
 
 # 4. Directories & Files
 ROOT_DIR="/Users/nlane/Development/siam"
@@ -57,6 +65,10 @@ DATA_DIR="$ROOT_DIR/data"
 SCOUT_DIR="$DATA_DIR/scout"
 RESULT_DIR="$DATA_DIR/results"
 PAIRS_FILE="$DATA_DIR/pairs.txt"
+TRAIN_PAIRS_FILE="$DATA_DIR/train_pairs.txt"
+EVAL_PAIRS_FILE="$DATA_DIR/eval_pairs.txt"
+CALIB_PAIRS_FILE="$DATA_DIR/calib_pairs.txt"
+CALIB_THRESH_FILE="$DATA_DIR/calib_thresh.txt"
 WEIGHTS="$DATA_DIR/siam.w"
 
 # Make binaries built by `make` available to the workflow scripts.

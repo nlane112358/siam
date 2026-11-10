@@ -1,13 +1,17 @@
 #pragma once
 
 #include "network.hpp"
+#include "dataset.hpp"
 
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdio>
 #include <random>
+#include <string>
+#include <unordered_map>
 #include <vector>
+
 namespace siam {
 
 class ContrastiveTrainer {
@@ -16,49 +20,131 @@ public:
         : encoder_(encoder), rng_(seed), cache_t0_(Config::BATCH_N), cache_t1_(Config::BATCH_N),
           batch_t0_(Config::BATCH_N), batch_t1_(Config::BATCH_N) {}
 
-    void train(const std::vector<ImagePair>& pairs, int steps, float base_lr, bool quiet) {
+    void train(std::vector<ImagePair>& pairs, int steps, float base_lr, bool quiet,
+               float stability_thresh = Config::DEFAULT_STABILITY_THRESH) {
+        if (pairs.empty()) {
+            throw std::runtime_error("siam: no image pairs provided for training");
+        }
+
+        // 1. Index valid and stable 32x32 patch locations across all pairs
+        size_t total_indexed = 0;
+        for (auto& pair : pairs) {
+            if (pair.valid_locs.empty()) {
+                index_valid_stable_patches(pair, stability_thresh);
+            }
+            total_indexed += pair.valid_locs.size();
+        }
+
+        // Fallback: if stability threshold was overly restrictive, index without stability constraint
+        if (total_indexed == 0 && stability_thresh < 1.0f) {
+            if (!quiet) {
+                std::fprintf(stderr, "siam: warning: zero patches met stability threshold %.2f; falling back to valid-pixel mask\n",
+                             stability_thresh);
+            }
+            for (auto& pair : pairs) {
+                index_valid_stable_patches(pair, 1.0f);
+                total_indexed += pair.valid_locs.size();
+            }
+        }
+        if (total_indexed == 0) {
+            throw std::runtime_error("siam: no valid patch locations found across image pairs (all pixels invalid or masked)");
+        }
+
+        // 2. Group pairs by geographic location to balance sampling across locations and dates
+        struct LocationGroup {
+            std::string id;
+            std::vector<size_t> pair_indices;
+        };
+        std::vector<LocationGroup> groups;
+        std::unordered_map<std::string, size_t> group_map;
+        for (size_t i = 0; i < pairs.size(); ++i) {
+            if (pairs[i].valid_locs.empty()) continue;
+            const std::string& loc_id = pairs[i].location_id;
+            auto it = group_map.find(loc_id);
+            if (it == group_map.end()) {
+                group_map[loc_id] = groups.size();
+                groups.push_back(LocationGroup{loc_id, {i}});
+            } else {
+                groups[it->second].pair_indices.push_back(i);
+            }
+        }
+
+        if (!quiet) {
+            std::fprintf(stderr, "siam: indexed %zu valid/stable patch locations across %zu pairs and %zu geographic locations\n",
+                         total_indexed, pairs.size(), groups.size());
+        }
+
         constexpr float pi = 3.14159265358979323846f;
         float ema_loss = 0.0f;
         std::uniform_real_distribution<float> gain_dist(-0.06f, 0.06f), bias_dist(-0.03f, 0.03f);
         std::uniform_int_distribution<int> jitter_dist(-1, 1), d4_dist(0, 7);
-        std::uniform_int_distribution<size_t> pair_dist(0, pairs.size() - 1);
+        std::uniform_int_distribution<size_t> loc_dist(0, groups.size() - 1);
+
         for (int step = 1; step <= steps; ++step) {
             const float progress = (steps > 1) ? static_cast<float>(step - 1) / static_cast<float>(steps - 1) : 0.0f;
             const float cur_lr = base_lr * (0.05f + 0.95f * 0.5f * (1.0f + std::cos(pi * progress)));
-            std::array<int, Config::BATCH_N> sampled_p{}, sampled_y{}, sampled_x{};
+
+            std::array<size_t, Config::BATCH_N> sampled_loc{};
+            std::array<size_t, Config::BATCH_N> sampled_p{};
+            std::array<int, Config::BATCH_N> sampled_y{}, sampled_x{};
+
             for (int b = 0; b < Config::BATCH_N; ++b) {
-                size_t p = 0;
-                int y0 = 0, x0 = 0, attempts = 0;
+                size_t loc_idx = 0, p = 0;
+                int y0 = 0, x0 = 0;
+                int attempts = 0;
+
                 do {
-                    p = pair_dist(rng_);
+                    loc_idx = loc_dist(rng_);
+                    const auto& pair_list = groups[loc_idx].pair_indices;
+                    std::uniform_int_distribution<size_t> p_dist(0, pair_list.size() - 1);
+                    p = pair_list[p_dist(rng_)];
+
+                    const auto& valid_locs = pairs[p].valid_locs;
+                    std::uniform_int_distribution<size_t> loc_pick(0, valid_locs.size() - 1);
+                    const uint32_t packed = valid_locs[loc_pick(rng_)];
+                    y0 = static_cast<int>(packed >> 16);
+                    x0 = static_cast<int>(packed & 0xFFFF);
+
+                    // Add small coordinate jitter if within bounds
                     const PgmImage& pre_img = pairs[p].pre;
-                    y0 = (pre_img.height() > Config::PATCH_S + 1)
-                       ? std::uniform_int_distribution<int>(1, pre_img.height() - Config::PATCH_S - 1)(rng_) : 0;
-                    x0 = (pre_img.width() > Config::PATCH_S + 1)
-                       ? std::uniform_int_distribution<int>(1, pre_img.width() - Config::PATCH_S - 1)(rng_) : 0;
+                    if (y0 + 1 <= pre_img.height() - Config::PATCH_S && (rng_() & 1)) y0 += 1;
+                    if (x0 + 1 <= pre_img.width() - Config::PATCH_S && (rng_() & 1)) x0 += 1;
+
+                    // Ensure no overlapping neighboring patches in the batch as negatives
                     bool collision = false;
                     for (int prev = 0; prev < b; ++prev) {
-                        if (sampled_p[prev] == static_cast<int>(p) &&
-                            std::abs(sampled_y[prev] - y0) < Config::PATCH_S / 2 &&
-                            std::abs(sampled_x[prev] - x0) < Config::PATCH_S / 2) {
-                            collision = true; break;
+                        if (sampled_loc[prev] == loc_idx) {
+                            if (std::abs(sampled_y[prev] - y0) < Config::PATCH_S &&
+                                std::abs(sampled_x[prev] - x0) < Config::PATCH_S) {
+                                collision = true;
+                                break;
+                            }
                         }
                     }
                     if (!collision) break;
-                } while (++attempts < 16);
-                sampled_p[b] = static_cast<int>(p); sampled_y[b] = y0; sampled_x[b] = x0;
+                } while (++attempts < 32);
+
+                sampled_loc[b] = loc_idx;
+                sampled_p[b] = p;
+                sampled_y[b] = y0;
+                sampled_x[b] = x0;
+
                 const PgmImage& pre_img = pairs[p].pre;
                 const PgmImage& post_img = pairs[p].post;
                 const int jy = (pre_img.height() > Config::PATCH_S + 1) ? jitter_dist(rng_) : 0;
                 const int jx = (pre_img.width() > Config::PATCH_S + 1) ? jitter_dist(rng_) : 0;
                 const int d4 = d4_dist(rng_);
+
                 pre_img.extract_patch(y0, x0, batch_t0_[b], 1.0f + gain_dist(rng_), bias_dist(rng_), d4);
                 post_img.extract_patch(y0 + jy, x0 + jx, batch_t1_[b], 1.0f + gain_dist(rng_), bias_dist(rng_), d4);
             }
+
             const float loss = step_batch(cur_lr, 1e-4f);
             ema_loss = (step == 1) ? loss : (0.95f * ema_loss + 0.05f * loss);
-            if (!quiet && (step == 1 || step % 25 == 0 || step == steps))
-                std::fprintf(stderr, "siam: step %4d/%d lr=%.5f loss=%.5f ema=%.5f\n", step, steps, cur_lr, loss, ema_loss);
+            if (!quiet && (step == 1 || step % 25 == 0 || step == steps)) {
+                std::fprintf(stderr, "siam: step %4d/%d lr=%.5f loss=%.5f ema=%.5f\n",
+                             step, steps, cur_lr, loss, ema_loss);
+            }
         }
     }
 

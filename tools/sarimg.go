@@ -39,12 +39,14 @@ type config struct {
 	upsample   string
 	stride     int
 	baseImg    string
+	maskImg    string
 	dropImg    string
 	incImg     string
 	changeImg  string
 	monoChange bool
 	pairs      bool
 	overwrite  bool
+	emitMask   bool
 	workers    int
 }
 
@@ -52,6 +54,7 @@ type raster struct {
 	w, h, ch, maxv int
 	gray           []float64 // [0,1] for single-band
 	rgb            []uint8   // 3*w*h for P3/P6 PPM
+	valid          []bool
 }
 
 func main() {
@@ -70,11 +73,13 @@ func main() {
 	flag.StringVar(&cfg.upsample, "upsample", "", "reference file or WxH to bilinearly upsample tile maps")
 	flag.IntVar(&cfg.stride, "stride", 8, "siam stride for -upsample")
 	flag.StringVar(&cfg.baseImg, "base", "", "base SAR image for directional/change overlay PNG")
+	flag.StringVar(&cfg.maskImg, "mask", "", "PGM validity mask; zero-valued pixels hide the PNG output")
 	flag.StringVar(&cfg.changeImg, "change", "", "siam -o change.pgm to overlay on -base")
 	flag.BoolVar(&cfg.monoChange, "mono-change", false, "draw change values as bright grayscale on -base")
 	flag.StringVar(&cfg.dropImg, "drop", "", "siam -D drop.pgm (cyan) to overlay on -base")
 	flag.StringVar(&cfg.incImg, "inc", "", "siam -I increase.pgm (red-orange) to overlay on -base")
 	flag.BoolVar(&cfg.pairs, "pairs", false, "emit chronological PRE POST PGM pairs to stdout")
+	flag.BoolVar(&cfg.emitMask, "emit-mask", false, "save binary valid-pixel mask PGM (_mask.pgm)")
 	flag.BoolVar(&cfg.overwrite, "overwrite", false, "regenerate existing output files")
 	flag.IntVar(&cfg.workers, "workers", runtime.NumCPU(), "concurrent workers")
 	flag.Parse()
@@ -201,12 +206,31 @@ func processOne(src string, cfg config) ([]string, error) {
 			return nil, err
 		}
 		pgms = append(pgms, pgmOut)
+		if cfg.emitMask && len(ras.valid) == ras.w*ras.h {
+			maskOut := strings.TrimSuffix(pgmOut, ".pgm") + "_mask.pgm"
+			maskRas := &raster{w: ras.w, h: ras.h, ch: 1, maxv: 255, gray: make([]float64, ras.w*ras.h)}
+			for i, ok := range ras.valid {
+				if ok {
+					maskRas.gray[i] = 1.0
+				}
+			}
+			if err := savePGM(maskOut, maskRas, 8); err != nil {
+				return nil, err
+			}
+		}
 		if !cfg.pairs && pgmOut != "-" {
 			fmt.Println(pgmOut)
 		}
 	}
+	var mask *raster
+	if cfg.formats["png"] && cfg.maskImg != "" {
+		mask, _, _, _, err = loadRaster(cfg.maskImg, false, false, cfg)
+		if err != nil {
+			return nil, fmt.Errorf("load mask: %w", err)
+		}
+	}
 	if cfg.formats["png"] {
-		if err := savePNG(pngOut, ras, cfg.cmap, cfg.thresh); err != nil {
+		if err := savePNG(pngOut, ras, cfg.cmap, cfg.thresh, mask, cfg.stride); err != nil {
 			return nil, err
 		}
 		if !cfg.pairs && !cfg.formats["pgm"] && pngOut != "-" {
@@ -348,8 +372,10 @@ func readPNM(r io.Reader, stretch bool) (*raster, float64, float64, float64, err
 
 	var hist [65536]uint64
 	var nz uint64
-	for _, v := range raw {
+	ras.valid = make([]bool, n)
+	for i, v := range raw {
 		if v > 0 {
+			ras.valid[i] = true
 			hist[v]++
 			nz++
 		}
@@ -388,14 +414,27 @@ func writeChips(ras *raster, stem string, cfg config) ([]string, error) {
 	for gy := 0; gy < ras.h/cs; gy++ {
 		for gx := 0; gx < ras.w/cs; gx++ {
 			sub := &raster{w: cs, h: cs, ch: 1, maxv: ras.maxv, gray: make([]float64, cs*cs)}
+			var maskSub *raster
+			if cfg.emitMask {
+				maskSub = &raster{w: cs, h: cs, ch: 1, maxv: 255, gray: make([]float64, cs*cs)}
+			}
 			nz := 0
 			for y := 0; y < cs; y++ {
 				row := ras.gray[(gy*cs+y)*ras.w+gx*cs:]
 				for x := 0; x < cs; x++ {
 					v := row[x]
 					sub.gray[y*cs+x] = v
-					if v > 0 {
+					isValid := false
+					if len(ras.valid) > 0 {
+						isValid = ras.valid[(gy*cs+y)*ras.w+gx*cs]
+					} else {
+						isValid = (v > 0)
+					}
+					if isValid {
 						nz++
+						if maskSub != nil {
+							maskSub.gray[y*cs+x] = 1.0
+						}
 					}
 				}
 			}
@@ -409,9 +448,15 @@ func writeChips(ras *raster, stem string, cfg config) ([]string, error) {
 					return nil, err
 				}
 				pgms = append(pgms, pgmOut)
+				if cfg.emitMask && maskSub != nil {
+					maskOut := strings.TrimSuffix(pgmOut, ".pgm") + "_mask.pgm"
+					if err := savePGM(maskOut, maskSub, 8); err != nil {
+						return nil, err
+					}
+				}
 			}
 			if cfg.formats["png"] {
-				if err := savePNG(pngOut, sub, cfg.cmap, cfg.thresh); err != nil {
+				if err := savePNG(pngOut, sub, cfg.cmap, cfg.thresh, nil, cfg.stride); err != nil {
 					return nil, err
 				}
 			}
@@ -453,11 +498,19 @@ func savePGM(dst string, ras *raster, bits int) error {
 	return atomicWrite(dst, write)
 }
 
-func savePNG(dst string, ras *raster, cmap string, thresh float64) error {
+func savePNG(dst string, ras *raster, cmap string, thresh float64, mask *raster, stride int) error {
+	valid, err := validPixels(ras, mask, stride)
+	if err != nil {
+		return err
+	}
 	var img image.Image
 	if ras.ch == 3 {
 		rgba := image.NewRGBA(image.Rect(0, 0, ras.w, ras.h))
 		for i := 0; i < ras.w*ras.h; i++ {
+			if valid != nil && !valid[i] {
+				rgba.Pix[4*i+3] = 255
+				continue
+			}
 			rgba.Pix[4*i+0] = ras.rgb[3*i+0]
 			rgba.Pix[4*i+1] = ras.rgb[3*i+1]
 			rgba.Pix[4*i+2] = ras.rgb[3*i+2]
@@ -467,6 +520,10 @@ func savePNG(dst string, ras *raster, cmap string, thresh float64) error {
 	} else if strings.ToLower(cmap) == "inferno" {
 		rgba := image.NewRGBA(image.Rect(0, 0, ras.w, ras.h))
 		for i, v := range ras.gray {
+			if valid != nil && !valid[i] {
+				rgba.Pix[4*i+3] = 255
+				continue
+			}
 			if v < thresh {
 				v = 0
 			}
@@ -477,6 +534,9 @@ func savePNG(dst string, ras *raster, cmap string, thresh float64) error {
 	} else {
 		g := image.NewGray(image.Rect(0, 0, ras.w, ras.h))
 		for i, v := range ras.gray {
+			if valid != nil && !valid[i] {
+				continue
+			}
 			if v < thresh {
 				v = 0
 			}
@@ -485,6 +545,39 @@ func savePNG(dst string, ras *raster, cmap string, thresh float64) error {
 		img = g
 	}
 	return atomicWrite(dst, func(w io.Writer) error { return png.Encode(w, img) })
+}
+
+func validPixels(ras, mask *raster, stride int) ([]bool, error) {
+	if mask == nil {
+		return nil, nil
+	}
+	if mask.ch != 1 {
+		return nil, fmt.Errorf("mask must be a single-band PGM")
+	}
+	valid := make([]bool, ras.w*ras.h)
+	if mask.w == ras.w && mask.h == ras.h {
+		for i, v := range mask.gray {
+			valid[i] = v > 0
+		}
+		return valid, nil
+	}
+	if stride < 1 || mask.w < patchSize || mask.h < patchSize {
+		return nil, fmt.Errorf("mask dimensions %dx%d do not match output %dx%d", mask.w, mask.h, ras.w, ras.h)
+	}
+	gridW := (mask.w-patchSize)/stride + 1
+	gridH := (mask.h-patchSize)/stride + 1
+	if gridW != ras.w || gridH != ras.h {
+		return nil, fmt.Errorf("mask dimensions %dx%d do not match output %dx%d at stride %d", mask.w, mask.h, ras.w, ras.h, stride)
+	}
+	center := patchSize / 2
+	for y := 0; y < ras.h; y++ {
+		maskY := y*stride + center
+		for x := 0; x < ras.w; x++ {
+			maskX := x*stride + center
+			valid[y*ras.w+x] = mask.gray[maskY*mask.w+maskX] > 0
+		}
+	}
+	return valid, nil
 }
 
 func renderOverlay(cfg config) error {
@@ -603,6 +696,9 @@ func upsampleBilinear(src *raster, outW, outH, stride int) *raster {
 	if src.w == outW && src.h == outH {
 		return src
 	}
+	if src.ch == 3 {
+		return upsampleRGBNearest(src, outW, outH, stride)
+	}
 	gw, gh := src.w, src.h
 	hp := 0.5 * float64(patchSize-1)
 	invS := 1.0 / float64(stride)
@@ -632,6 +728,25 @@ func upsampleBilinear(src *raster, outW, outH, stride int) *raster {
 					dst.rgb[(y*outW+x)*3+c] = uint8(math.Max(0, math.Min(255, val+0.5)))
 				}
 			}
+		}
+	}
+	return dst
+}
+
+func upsampleRGBNearest(src *raster, outW, outH, stride int) *raster {
+	gw, gh := src.w, src.h
+	hp := 0.5 * float64(patchSize-1)
+	invS := 1.0 / float64(stride)
+	dst := &raster{w: outW, h: outH, ch: 3, maxv: 255, rgb: make([]uint8, outW*outH*3)}
+	for y := 0; y < outH; y++ {
+		fy := math.Max(0, math.Min(float64(gh-1), (float64(y)-hp)*invS))
+		sy := min(int(math.Floor(fy+0.5)), gh-1)
+		for x := 0; x < outW; x++ {
+			fx := math.Max(0, math.Min(float64(gw-1), (float64(x)-hp)*invS))
+			sx := min(int(math.Floor(fx+0.5)), gw-1)
+			srcIndex := (sy*gw + sx) * 3
+			dstIndex := (y*outW + x) * 3
+			copy(dst.rgb[dstIndex:dstIndex+3], src.rgb[srcIndex:srcIndex+3])
 		}
 	}
 	return dst

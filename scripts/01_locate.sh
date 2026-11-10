@@ -57,8 +57,10 @@ cat > "$LOCATOR_HTML" <<EOF
 <body>
 <div id="map"></div>
 <div class="panel">
-  <strong>Current config.sh BBOX (Gold)</strong>
-  <code id="bbox-out">BBOX="$BBOX"</code>
+  <strong>Target ROI BBOX (Gold)</strong>
+  <code id="bbox-out">ROI_BBOX="$ROI_BBOX"</code>
+  <strong>Regional Footprint (Green)</strong>
+  <code>TRAIN_BBOX="$TRAIN_BBOX"</code>
   <div id="cursor-coords">Cursor: --</div>
   <div style="margin-top:8px;">
     <label>SAR Scout Overlay Opacity: <input id="op" type="range" min="0" max="1" step="0.05" value="0.65"/></label>
@@ -69,17 +71,21 @@ cat > "$LOCATOR_HTML" <<EOF
   </div>
 </div>
 <script>
-const [w, s, e, n] = [$BBOX];
+const [w, s, e, n] = [$ROI_BBOX];
+const [tw, ts, te, tn] = [$TRAIN_BBOX];
 const scenes = $FOOTPRINTS_JSON;
 
 const sat = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {attribution: 'Esri Satellite'});
 const osm = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {attribution: 'OSM'});
 const labels = L.tileLayer('https://services.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}');
 
-const map = L.map('map', { layers: [sat, labels], boxZoom: false }).fitBounds([[s, w], [n, e]]);
+const map = L.map('map', { layers: [sat, labels], boxZoom: false }).fitBounds([[Math.min(s, ts), Math.min(w, tw)], [Math.max(n, tn), Math.max(e, te)]]);
 L.control.layers({"Optical Satellite": sat, "Street Map": osm}, {"Place Labels": labels}, {position: 'topleft'}).addTo(map);
 
 let aoiRect = L.rectangle([[s, w], [n, e]], {color: '#ffcc00', weight: 2, fillOpacity: 0.15}).addTo(map);
+if ('$TRAIN_BBOX' !== '$ROI_BBOX') {
+  L.rectangle([[ts, tw], [tn, te]], {color: '#00ff88', weight: 2, dashArray: '4,4', fillOpacity: 0.05}).addTo(map);
+}
 const overlays = [];
 
 scenes.forEach(sc => {

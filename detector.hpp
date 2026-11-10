@@ -155,6 +155,111 @@ public:
                     diff_alerts, num_pairs, 100.0 * static_cast<double>(diff_alerts) / static_cast<double>(num_pairs),
                     diff_mean - same_mean, roc_auc);
     }
+
+    struct CalibStats {
+        double mean = 0.0;
+        double stddev = 0.0;
+        float median = 0.0f;
+        float p90 = 0.0f;
+        float p95 = 0.0f;
+        float p98 = 0.0f;
+        float p99 = 0.0f;
+        float p995 = 0.0f;
+        float p999 = 0.0f;
+        float recommended_thresh = 0.0f;
+        size_t total_tiles = 0;
+    };
+
+    CalibStats calibrate(const std::vector<ImagePair>& pairs, int stride,
+                         float target_p_fa, const std::string& out_path,
+                         bool quiet) const {
+        if (pairs.empty()) {
+            throw std::runtime_error("siam: calibrate mode (-C) requires at least one image pair");
+        }
+        std::vector<float> all_dists;
+        double sum = 0.0, sum_sq = 0.0;
+
+        for (const auto& pair : pairs) {
+            const PgmImage& pre = pair.pre;
+            const PgmImage& post = pair.post;
+            const int h = std::min(pre.height(), post.height());
+            const int w = std::min(pre.width(), post.width());
+            if (h < Config::PATCH_S || w < Config::PATCH_S) continue;
+            const int gh = (h - Config::PATCH_S) / stride + 1;
+            const int gw = (w - Config::PATCH_S) / stride + 1;
+            const size_t n_tiles = static_cast<size_t>(gh) * gw;
+
+            const auto u0 = encoder_.extract_scene_embeddings(pre, h, w, stride);
+            const auto u1 = encoder_.extract_scene_embeddings(post, h, w, stride);
+
+            for (size_t t = 0; t < n_tiles; ++t) {
+                float cos_sim = 0.0f;
+                for (int d = 0; d < Config::EMBED_D; ++d) {
+                    cos_sim += u0[t][d] * u1[t][d];
+                }
+                const float cos_dist = 0.5f * (1.0f - cos_sim);
+                all_dists.push_back(cos_dist);
+                sum += static_cast<double>(cos_dist);
+                sum_sq += static_cast<double>(cos_dist) * static_cast<double>(cos_dist);
+            }
+        }
+
+        if (all_dists.empty()) {
+            throw std::runtime_error("siam: no valid tiles found for calibration");
+        }
+
+        const size_t n = all_dists.size();
+        std::sort(all_dists.begin(), all_dists.end());
+
+        CalibStats stats;
+        stats.total_tiles = n;
+        stats.mean = sum / static_cast<double>(n);
+        const double var = std::max(0.0, (sum_sq / static_cast<double>(n)) - (stats.mean * stats.mean));
+        stats.stddev = std::sqrt(var);
+
+        auto get_p = [&](double p) -> float {
+            double idx = p * static_cast<double>(n - 1);
+            size_t lo = static_cast<size_t>(std::floor(idx));
+            size_t hi = static_cast<size_t>(std::ceil(idx));
+            if (hi >= n) hi = n - 1;
+            double frac = idx - static_cast<double>(lo);
+            return static_cast<float>((1.0 - frac) * all_dists[lo] + frac * all_dists[hi]);
+        };
+
+        stats.median = get_p(0.50);
+        stats.p90 = get_p(0.90);
+        stats.p95 = get_p(0.95);
+        stats.p98 = get_p(0.98);
+        stats.p99 = get_p(0.99);
+        stats.p995 = get_p(0.995);
+        stats.p999 = get_p(0.999);
+
+        const double p_target = std::clamp(1.0 - static_cast<double>(target_p_fa), 0.50, 0.9999);
+        stats.recommended_thresh = get_p(p_target);
+
+        if (!quiet) {
+            std::printf("siam: target ROI calibration across %zu pair(s) (%zu tiles, stride=%d)\n"
+                        "  baseline distribution:\n"
+                        "    mean=%.4f  std=%.4f  median=%.4f\n"
+                        "    p90=%.4f   p95=%.4f   p98=%.4f   p99=%.4f   p99.5=%.4f   p99.9=%.4f\n"
+                        "  target false alarm rate P_fa: %.4f (percentile: %.2f%%)\n"
+                        "  calibrated tile_thresh:       %.4f\n",
+                        pairs.size(), n, stride,
+                        stats.mean, stats.stddev, stats.median,
+                        stats.p90, stats.p95, stats.p98, stats.p99, stats.p995, stats.p999,
+                        target_p_fa, p_target * 100.0, stats.recommended_thresh);
+        }
+
+        if (!out_path.empty() && out_path != "-") {
+            FileHandle fh(out_path, "w", stdout);
+            std::fprintf(fh.get(), "%.4f\n", stats.recommended_thresh);
+        } else if (out_path == "-") {
+            std::printf("%.4f\n", stats.recommended_thresh);
+        }
+
+        return stats;
+    }
+
 private:
     std::vector<Embedding> extract_scene_embeddings_in_rows(const PgmImage& img,
                                                               int stride) const {

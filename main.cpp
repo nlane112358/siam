@@ -29,24 +29,26 @@ static void usage(FILE* out) {
         "    siam [options] PRE POST\n"
         "    siam -t [options] [PRE POST]...\n"
         "    siam -e [options] [PRE POST]...\n"
+        "    siam -C [options] [PRE POST]...\n"
         "    siam -h\n"
         "\n"
         "DESCRIPTION\n"
         "    PRE and POST are P2 or P5 PGM images (8-bit or 16-bit) with matching\n"
-        "    dimensions of at least 32x32 pixels. Training and evaluation accept\n"
-        "    image pairs as operands, from a pair list (-L FILE), or from standard\n"
+        "    dimensions of at least 32x32 pixels. Training, evaluation, and calibration\n"
+        "    accept image pairs as operands, from a pair list (-L FILE), or from standard\n"
         "    input (-). Each pair-list entry is PRE POST.\n"
         "\n"
         "OPTIONS\n"
         "    -h              display help and exit\n"
         "    -t              train\n"
         "    -e              evaluate matched and mismatched pairs (at least 2 pairs)\n"
+        "    -C              calibrate threshold on baseline/historical pairs\n"
         "    -c              continue training from saved weights\n"
         "    -q              suppress training progress and inference status\n"
         "    -u              upsample the inference map to input dimensions\n"
         "    -w FILE         weights file [siam.w]\n"
         "    -L FILE         read image pairs from FILE; '-' means standard input\n"
-        "    -o FILE         write the inference map to FILE; '-' means standard output\n"
+        "    -o FILE         write output map or calibrated threshold to FILE; '-' means stdout\n"
         "    -v FILE         write POST tile embeddings as a PCA false-color P6 PPM; '-' means stdout\n"
         "    -D FILE         write anomalous backscatter-drop tiles to FILE\n"
         "    -I FILE         write anomalous backscatter-increase tiles to FILE\n"
@@ -54,8 +56,9 @@ static void usage(FILE* out) {
         "    -l RATE         learning rate [0.01]\n"
         "    -S SEED         random seed [time and process ID]\n"
         "    -a VALUE        tile distance threshold [0.35]\n"
-        "    -f VALUE        alert fraction threshold [0.05]\n"
+        "    -f VALUE        alert fraction / calibration target P_fa [0.05]\n"
         "    -s PIXELS       sliding-window stride [8]\n"
+        "    -T VALUE        temporal stability threshold for positive training patches [0.20]\n"
         "\n"
         "EXIT STATUS\n"
         "    0   normal result or successful training/evaluation\n"
@@ -67,23 +70,26 @@ static void usage(FILE* out) {
         "    siam -w siam.w -o change.pgm -v embedding.ppm before.pgm after.pgm\n"
         "    siam -w siam.w -o change.pgm -D drop.pgm -I increase.pgm before.pgm after.pgm\n"
         "    siam -t -w siam.w -n 200 -L train_pairs.txt\n"
-        "    siam -e -w siam.w -L heldout_pairs.txt\n");
+        "    siam -e -w siam.w -L heldout_pairs.txt\n"
+        "    siam -C -w siam.w -L calib_pairs.txt -f 0.005 -o calib_thresh.txt\n");
 }
 
 int main(int argc, char** argv) {
     using namespace siam;
-    bool train_mode = false, eval_mode = false, continue_weights = false;
+    bool train_mode = false, eval_mode = false, calib_mode = false, continue_weights = false;
     bool upsample = false, quiet = false;
     int steps = 200, stride = 8;
     float lr = 0.01f, tile_thresh = 0.35f, alert_frac = 0.05f;
+    float stability_thresh = Config::DEFAULT_STABILITY_THRESH;
     uint32_t seed = static_cast<uint32_t>(std::time(nullptr)) ^ static_cast<uint32_t>(getpid());
     std::string weights_path = "siam.w", list_path, out_path = "-", embedding_map_path;
     std::string drop_path, increase_path;
     bool embedding_map_requested = false;
     int opt;
-    while ((opt = getopt(argc, argv, "tecquv:w:L:o:D:I:n:l:a:f:s:S:h")) != -1) {
+    while ((opt = getopt(argc, argv, "tCeqquv:w:L:o:D:I:n:l:a:f:s:S:T:h")) != -1) {
         switch (opt) {
             case 't': train_mode = true; break;
+            case 'C': calib_mode = true; break;
             case 'e': eval_mode = true; break;
             case 'c': continue_weights = true; break;
             case 'u': upsample = true; break;
@@ -100,16 +106,18 @@ int main(int argc, char** argv) {
             case 'f': alert_frac = std::strtof(optarg, nullptr); break;
             case 's': stride = std::atoi(optarg); break;
             case 'S': seed = static_cast<uint32_t>(std::strtoul(optarg, nullptr, 10)); break;
+            case 'T': stability_thresh = std::strtof(optarg, nullptr); break;
             case 'h': usage(stdout); return EXIT_NORMAL;
             default: usage(stderr); return EXIT_TROUBLE;
         }
     }
     const bool directional = !drop_path.empty() || !increase_path.empty();
-    if ((train_mode && eval_mode) || stride < 1 || steps < 1 ||
+    const int mode_count = (train_mode ? 1 : 0) + (eval_mode ? 1 : 0) + (calib_mode ? 1 : 0);
+    if (mode_count > 1 || stride < 1 || steps < 1 ||
         (drop_path.empty() != increase_path.empty()) ||
-        (directional && (train_mode || eval_mode || drop_path == "-" || increase_path == "-")) ||
+        (directional && (mode_count > 0 || drop_path == "-" || increase_path == "-")) ||
         (directional && (drop_path == increase_path || drop_path == out_path || increase_path == out_path)) ||
-        (embedding_map_requested && (embedding_map_path.empty() || train_mode || eval_mode ||
+        (embedding_map_requested && (embedding_map_path.empty() || mode_count > 0 ||
             embedding_map_path == out_path ||
             (directional && (embedding_map_path == drop_path || embedding_map_path == increase_path))))) {
         usage(stderr); return EXIT_TROUBLE;
@@ -124,7 +132,7 @@ int main(int argc, char** argv) {
             if (continue_weights) encoder.load_weights(weights_path);
             else encoder.init_kaiming(init_rng);
             ContrastiveTrainer trainer(encoder, seed);
-            trainer.train(pairs, steps, lr, quiet);
+            trainer.train(pairs, steps, lr, quiet, stability_thresh);
             encoder.save_weights(weights_path);
             return EXIT_NORMAL;
         }
@@ -133,6 +141,13 @@ int main(int argc, char** argv) {
             encoder.load_weights(weights_path);
             ChangeDetector detector(encoder);
             detector.evaluate(pairs, stride, tile_thresh, alert_frac);
+            return EXIT_NORMAL;
+        }
+        if (calib_mode) {
+            auto pairs = load_all_pairs(argc, argv, optind, list_path);
+            encoder.load_weights(weights_path);
+            ChangeDetector detector(encoder);
+            detector.calibrate(pairs, stride, alert_frac, out_path, quiet);
             return EXIT_NORMAL;
         }
         if (!list_path.empty() || (argc - optind) != 2) {

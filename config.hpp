@@ -24,6 +24,8 @@ struct Config {
     static constexpr int TOTAL_BIASES = C1 + C2 + EMBED_D;
     static constexpr int TOTAL_PARAMS = TOTAL_WEIGHTS + TOTAL_BIASES;
     static constexpr uint32_t MAGIC = 0x5349414Du;
+    static constexpr float DEFAULT_STABILITY_THRESH = 0.20f;
+    static constexpr float DEFAULT_CALIB_P_FA = 0.005f;
 };
 
 using Embedding = std::array<float, Config::EMBED_D>;

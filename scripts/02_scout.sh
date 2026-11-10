@@ -3,7 +3,8 @@
 set -euo pipefail
 source "$(dirname "$0")/config.sh"
 
-ASF_ARGS=(-bbox "$BBOX" -from "$FROM" -to "$TO" -pol "$POL" -limit "$DOWNLOAD_LIMIT" -out "$DATA_DIR")
+SCOUT_BBOX="${TRAIN_BBOX:-$BBOX}"
+ASF_ARGS=(-bbox "$SCOUT_BBOX" -from "$FROM" -to "$TO" -pol "$POL" -limit "$DOWNLOAD_LIMIT" -out "$DATA_DIR")
 [[ -n "$DIRECTION" ]] && ASF_ARGS+=(-direction "$DIRECTION")
 [[ -n "$ORBIT" ]]     && ASF_ARGS+=(-orbit "$ORBIT")
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 05_infer.sh — Run cosine-distance change detection, render PNG overlays, and clean up PGMs
+# 05_infer.sh — Run full-scene change detection, render maps, and clean up PGMs
 set -euo pipefail
 source "$(dirname "$0")/config.sh"
 
@@ -12,6 +12,15 @@ SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/siam-infer.XXXXXX")"
 trap 'rm -rf "$SCRATCH"' EXIT INT TERM
 
 NEW_PNGS=()
+
+if [[ -f "$CALIB_THRESH_FILE" ]]; then
+    CALIB_VAL="$(cat "$CALIB_THRESH_FILE" | tr -d '[:space:]')"
+    if [[ -n "$CALIB_VAL" ]]; then
+        CHANGE_MAP_THRESH="$CALIB_VAL"
+        TILE_THRESH="$CALIB_VAL"
+        echo "==> Using ROI-calibrated change threshold: TILE_THRESH=$TILE_THRESH (from $CALIB_THRESH_FILE)"
+    fi
+fi
 
 find_scene_tif() {
     local stem="$1"
@@ -49,84 +58,71 @@ while read -r PRE_PGM POST_PGM; do
     POST_STEM="$(basename "${POST_PGM%.pgm}")"
     TAG="${PRE_STEM}__to__${POST_STEM}"
 
-    CHG="$SCRATCH/chg.pgm"
-    DRP="$SCRATCH/drp.pgm"
-    INC="$SCRATCH/inc.pgm"
-    EMB="$SCRATCH/emb.ppm"
-
-    # Exit code 1 = EXIT_ALERT (anomalies detected), 0 = normal, 2 = error
-    rc=0
-    siam -w "$WEIGHTS" -s "$STRIDE" -a "$TILE_THRESH" -f "$ALERT_FRAC" \
-        -o "$CHG" -D "$DRP" -I "$INC" -v "$EMB" \
-        "$PRE_PGM" "$POST_PGM" || rc=$?
-    [[ "$rc" -eq 2 ]] && exit 2
-
-    OVERLAY_PNG="$RESULT_DIR/${TAG}_overlay.png"
     CHANGE_PNG="$RESULT_DIR/${TAG}_change.png"
     PCA_PNG="$RESULT_DIR/${TAG}_pca.png"
-    FULL_PCA_PNG="$RESULT_DIR/${TAG}_full_scene_pca.png"
-    FULL_CHANGE_PNG="$RESULT_DIR/${TAG}_full_scene_change.png"
+    rm -f "$CHANGE_PNG" "$PCA_PNG" \
+          "$RESULT_DIR/${TAG}_overlay.png" \
+          "$RESULT_DIR/${TAG}_full_scene_change.png" \
+          "$RESULT_DIR/${TAG}_full_scene_pca.png"
 
-    sarimg -base "$POST_PGM" -change "$CHG" -drop "$DRP" -inc "$INC" \
-           -stride "$STRIDE" -thresh "$OVERLAY_THRESH" -o "$OVERLAY_PNG"
-    sarimg -mono-change -base "$POST_PGM" -change "$CHG" \
-           -stride "$STRIDE" -thresh "$OVERLAY_THRESH" -o "$CHANGE_PNG"
-    # PCA colors show relative variation in learned embeddings, not detections.
-    sarimg -upsample "$POST_PGM" -stride "$STRIDE" -o "$PCA_PNG" "$EMB"
+    if ! PRE_TIF="$(find_scene_tif "$PRE_STEM")" || ! POST_TIF="$(find_scene_tif "$POST_STEM")"; then
+        echo "Skipping $TAG: full-scene inference needs both source TIFFs." >&2
+        continue
+    fi
+    if ! FULL_BBOX="$(full_scene_bbox "$POST_TIF")"; then
+        echo "Warning: could not read full-scene bounds for $POST_TIF; skipping $TAG." >&2
+        continue
+    fi
 
-    NEW_PNGS+=("$OVERLAY_PNG" "$CHANGE_PNG" "$PCA_PNG")
+    echo "==> Creating full-scene change map and PCA for $TAG at ${FULL_PCA_RES}m/pixel..."
+    FULL_DIR="$SCRATCH/full_scene"
+    mkdir -p "$FULL_DIR"
+    if ! sarimg -bbox "$FULL_BBOX" -res "$FULL_PCA_RES" -min-cov 0.01 \
+        -bits "$PGM_BITS" -to pgm -overwrite -o "$FULL_DIR" \
+        "$PRE_TIF" "$POST_TIF"; then
+        echo "Warning: could not align full-scene TIFFs for $TAG; skipping." >&2
+        continue
+    fi
 
-    if PRE_TIF="$(find_scene_tif "$PRE_STEM")" && POST_TIF="$(find_scene_tif "$POST_STEM")"; then
-        if FULL_BBOX="$(full_scene_bbox "$POST_TIF")"; then
-            echo "==> Creating full-scene change map and PCA for $TAG at ${FULL_PCA_RES}m/pixel..."
-            FULL_DIR="$SCRATCH/full_scene"
-            mkdir -p "$FULL_DIR"
-            if sarimg -bbox "$FULL_BBOX" -res "$FULL_PCA_RES" -min-cov 0.01 \
-                -bits "$PGM_BITS" -to pgm -overwrite -o "$FULL_DIR" \
-                "$PRE_TIF" "$POST_TIF"; then
-                FULL_PRE_PGM="$FULL_DIR/$PRE_STEM.pgm"
-                FULL_POST_PGM="$FULL_DIR/$POST_STEM.pgm"
-                FULL_CHG="$SCRATCH/${TAG}_full_scene_change.pgm"
-                FULL_EMB="$SCRATCH/${TAG}_full_scene_embeddings.ppm"
-                full_rc=0
-                siam -q -w "$WEIGHTS" -s "$STRIDE" -o "$FULL_CHG" -v "$FULL_EMB" \
-                    "$FULL_PRE_PGM" "$FULL_POST_PGM" || full_rc=$?
-                if [[ "$full_rc" -eq 2 ]]; then
-                    echo "Warning: full-scene inference failed for $TAG; keeping the ROI outputs." >&2
-                else
-                    # Keep the native embedding tile grid; upsampling it softened the full-scene view.
-                    if sarimg -o "$FULL_PCA_PNG" "$FULL_EMB"; then
-                        NEW_PNGS+=("$FULL_PCA_PNG")
-                    else
-                        echo "Warning: could not render full-scene PCA for $TAG; keeping the ROI outputs." >&2
-                    fi
-                    if sarimg -mono-change -base "$FULL_POST_PGM" -change "$FULL_CHG" \
-                        -stride "$STRIDE" -thresh "$OVERLAY_THRESH" -o "$FULL_CHANGE_PNG"; then
-                        NEW_PNGS+=("$FULL_CHANGE_PNG")
-                    else
-                        echo "Warning: could not render full-scene change map for $TAG; keeping the ROI outputs." >&2
-                    fi
-                fi
-            else
-                echo "Warning: could not align full-scene TIFFs for $TAG; keeping the ROI outputs." >&2
-            fi
-        else
-            echo "Warning: could not read full-scene bounds for $POST_TIF; keeping the ROI outputs." >&2
-        fi
+    FULL_PRE_PGM="$FULL_DIR/$PRE_STEM.pgm"
+    FULL_POST_PGM="$FULL_DIR/$POST_STEM.pgm"
+    FULL_CHG="$SCRATCH/${TAG}_change.pgm"
+    FULL_EMB="$SCRATCH/${TAG}_embeddings.ppm"
+    full_rc=0
+    siam -q -w "$WEIGHTS" -s "$STRIDE" -o "$FULL_CHG" -v "$FULL_EMB" \
+        "$FULL_PRE_PGM" "$FULL_POST_PGM" || full_rc=$?
+    if [[ "$full_rc" -eq 2 ]]; then
+        echo "Warning: full-scene inference failed for $TAG; skipping." >&2
+        continue
+    fi
+
+    if sarimg -mask "$FULL_POST_PGM" -upsample "$FULL_POST_PGM" -stride "$STRIDE" \
+        -thresh "$CHANGE_MAP_THRESH" -cmap gray -overwrite -o "$CHANGE_PNG" "$FULL_CHG"; then
+        NEW_PNGS+=("$CHANGE_PNG")
     else
-        echo "Skipping full-scene PCA for $TAG: source TIFFs are missing (retain them through inference)." >&2
+        echo "Warning: could not render standalone full-scene change map for $TAG." >&2
+    fi
+
+    # Keep the native embedding tile grid, and mask no-data from the POST scene.
+    if sarimg -mask "$FULL_POST_PGM" -stride "$STRIDE" -overwrite \
+        -o "$PCA_PNG" "$FULL_EMB"; then
+        NEW_PNGS+=("$PCA_PNG")
+    else
+        echo "Warning: could not render full-scene PCA for $TAG." >&2
     fi
 done < "$PAIRS_FILE"
 
 echo "==> Opening inference results in $RESULT_DIR..."
 echo "    PCA colors show relative embedding variation, not detections."
-echo "    Change maps use grayscale SAR backscatter with detections brightened in white."
-echo "    Full-scene PCA uses ${FULL_PCA_RES}m input pixels and stride ${STRIDE}; each color represents one tile."
-echo "    Full-scene change maps keep the SAR footprint and black no-data areas."
-open_files "${NEW_PNGS[@]}"
+echo "    Change maps show standalone grayscale anomaly intensity on black."
+echo "    Change and PCA maps cover the full SAR scenes; no-data areas remain black."
+echo "    PCA uses ${FULL_PCA_RES}m input pixels and stride ${STRIDE}; each color represents one tile."
+if [[ "${OPEN_RESULTS:-1}" == "1" ]]; then
+    open_files "${NEW_PNGS[@]}"
+fi
 
 echo ""
-read -r -p "Inference complete. Delete aligned .pgm files ($DATA_DIR/pgm) to free storage? [y/N] " ans
+read -r -p "Inference complete. Delete aligned PGM files in $DATA_DIR/pgm to free storage? [y/N] " ans
 if [[ "$ans" =~ ^[yY] ]]; then
     rm -rf "$DATA_DIR/pgm" "$PAIRS_FILE"
     echo "==> Deleted $DATA_DIR/pgm. Only lightweight PNGs and $WEIGHTS remain on disk."

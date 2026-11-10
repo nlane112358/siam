@@ -41,25 +41,23 @@ OPTIONS
     -h              display help and exit
     -t              train
     -e              evaluate matched and mismatched pairs (at least 2 pairs)
+    -C              calibrate threshold on baseline/historical pairs
     -c              continue training from saved weights
     -q              suppress training progress and inference status
     -u              upsample the inference map to input dimensions
     -w FILE         weights file [siam.w]
     -L FILE         read image pairs from FILE; '-' means standard input
-    -o FILE         write residual-innovation distance map; '-' means standard output
+    -o FILE         write output map or calibrated threshold to FILE; '-' means stdout
     -v FILE         write POST tile embeddings as a PCA false-color P6 PPM; '-' means stdout
-    -k FILE         write selected scale per tile as PGM (4, 8, 16, 32 cells)
-    -m FILE         write motion field as an HSV false-color P6 PPM
     -D FILE         write anomalous backscatter-drop tiles to FILE
     -I FILE         write anomalous backscatter-increase tiles to FILE
     -n STEPS        training steps [200]
     -l RATE         learning rate [0.01]
     -S SEED         random seed [time and process ID]
-    -p VALUE        image false-alarm probability for inference [1e-6]
-    -M FILE         read and update per-tile vMF state; FRAME is one image
-    -a VALUE        evaluation cosine-distance threshold [0.35]
-    -f VALUE        evaluation alert fraction threshold [0.05]
+    -a VALUE        tile distance threshold [0.35]
+    -f VALUE        alert fraction / calibration target P_fa [0.05]
     -s PIXELS       sliding-window stride [8]
+    -T VALUE        temporal stability threshold for positive training patches [0.20]
 
 EXIT STATUS
     0   normal result or successful training/evaluation
@@ -72,6 +70,7 @@ EXAMPLES
     siam -w siam.w -o change.pgm -D drop.pgm -I increase.pgm before.pgm after.pgm
     siam -t -w siam.w -n 200 -L train_pairs.txt
     siam -e -w siam.w -L heldout_pairs.txt
+    siam -C -w siam.w -L calib_pairs.txt -f 0.005 -o calib_thresh.txt
 ```
 
 ### 1. Train (`-t`)
@@ -109,7 +108,23 @@ siam: evaluated 103 pairs (383263 tiles, stride=8, thresh=0.35)
   tile ROC-AUC:               0.9811
 ```
 
-### 3. Inference & Alerting
+### 3. Calibrate (`-C`)
+Profile empirical baseline variation across historical non-event pairs of the target ROI to calibrate the change detection threshold for a target false-alarm rate:
+
+```sh
+./bin/siam -C -w siam.w -L calib_pairs.txt -f 0.005 -o calib_thresh.txt
+```
+
+```text
+siam: target ROI calibration across 4 pair(s) (21930 tiles, stride=8)
+  baseline distribution:
+    mean=0.0111  std=0.0171  median=0.0046
+    p90=0.0309   p95=0.0462   p98=0.0654   p99=0.0805   p99.5=0.0951   p99.9=0.1357
+  target false alarm rate P_fa: 0.0050 (percentile: 99.50%)
+  calibrated tile_thresh:       0.0951
+```
+
+### 4. Inference & Alerting
 Follows POSIX `diff(1)` / `cmp(1)` exit conventions (`0` = normal, `1` = anomaly alert triggered, `2` = error):
 
 ```sh
@@ -203,13 +218,13 @@ so coherent regions may emerge, but colors do not have fixed meanings such as
 water or urban and are not comparable across scenes. The `-u` option only
 upsamples the PGM inference and directional maps.
 
-The displayed PNG masks zero-valued tile centers outside the valid data footprint; the P6 output from `siam` retains the computed colors for every tile.
+The full-scene PCA PNG stays at one pixel per inference tile to preserve component detail. It uses the POST PGM as a mask so invalid areas render black. The P6 output from `siam` retains the computed colors for every tile.
 
 ![PCA false-color embedding example](docs/pca-embedding.png)
 
 ## SAR examples
 
-The change PNGs keep the POST SAR backscatter as a grayscale background and brighten detected changes in white. When the source TIFFs are available, inference also writes a `${TAG}_full_scene_change.png` over the full swath; its rotated footprint and black no-data wedges follow the SAR scene. The matching `${TAG}_full_scene_pca.png` shows embedding variation at the same extent.
+Inference writes one `${TAG}_change.png` per pair, running detection over the source TIFFs at full-scene extent. It shows standalone grayscale change intensity on black, with the rotated footprint and no-data areas masked from the POST scene. The matching `${TAG}_pca.png` shows the RGB PCA components over the same extent. The workflow does not create SAR-backed overlay PNGs and needs the source TIFFs through inference.
 
 ![Sentinel-1 SAR example](docs/sar-full-scene.png)
 

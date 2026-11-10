@@ -179,6 +179,21 @@ private:
     std::vector<float> pixels_;
 };
 
-struct ImagePair { PgmImage pre; PgmImage post; };
+struct ImagePair {
+    PgmImage pre;
+    PgmImage post;
+    PgmImage mask;
+    std::string location_id;
+    std::vector<uint32_t> valid_locs;
+
+    ImagePair() = default;
+    ImagePair(PgmImage pre_img, PgmImage post_img,
+              PgmImage mask_img = PgmImage(),
+              std::string loc_id = "",
+              std::vector<uint32_t> locs = {})
+        : pre(std::move(pre_img)), post(std::move(post_img)),
+          mask(std::move(mask_img)), location_id(std::move(loc_id)),
+          valid_locs(std::move(locs)) {}
+};
 
 } // namespace siam
