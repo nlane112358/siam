@@ -26,25 +26,26 @@ import (
 const patchSize = 32 // Matches siam::Config::PATCH_S
 
 type config struct {
-	out       string
-	formats   map[string]bool
-	bbox      *[4]float64
-	res       float64
-	minCov    float64
-	chip      int
-	bits      int
-	stretch   string
-	cmap      string
-	thresh    float64
-	upsample  string
-	stride    int
-	baseImg   string
-	dropImg   string
-	incImg    string
-	changeImg string
-	pairs     bool
-	overwrite bool
-	workers   int
+	out        string
+	formats    map[string]bool
+	bbox       *[4]float64
+	res        float64
+	minCov     float64
+	chip       int
+	bits       int
+	stretch    string
+	cmap       string
+	thresh     float64
+	upsample   string
+	stride     int
+	baseImg    string
+	dropImg    string
+	incImg     string
+	changeImg  string
+	monoChange bool
+	pairs      bool
+	overwrite  bool
+	workers    int
 }
 
 type raster struct {
@@ -70,6 +71,7 @@ func main() {
 	flag.IntVar(&cfg.stride, "stride", 8, "siam stride for -upsample")
 	flag.StringVar(&cfg.baseImg, "base", "", "base SAR image for directional/change overlay PNG")
 	flag.StringVar(&cfg.changeImg, "change", "", "siam -o change.pgm to overlay on -base")
+	flag.BoolVar(&cfg.monoChange, "mono-change", false, "draw change values as bright grayscale on -base")
 	flag.StringVar(&cfg.dropImg, "drop", "", "siam -D drop.pgm (cyan) to overlay on -base")
 	flag.StringVar(&cfg.incImg, "inc", "", "siam -I increase.pgm (red-orange) to overlay on -base")
 	flag.BoolVar(&cfg.pairs, "pairs", false, "emit chronological PRE POST PGM pairs to stdout")
@@ -527,8 +529,16 @@ func renderOverlay(cfg config) error {
 		bg := base.gray[i] * 255.0
 		or, og, ob, a := 0.0, 0.0, 0.0, 0.0
 		if chMap != nil && chMap[i] >= cfg.thresh && chMap[i] > 0 {
-			c := inferno(chMap[i])
-			or, og, ob, a = float64(c.R), float64(c.G), float64(c.B), 0.75*math.Min(1.0, chMap[i]*1.8)
+			a = 0.75 * math.Min(1.0, chMap[i]*1.8)
+			if cfg.monoChange {
+				or, og, ob = 255, 255, 255
+				if bg == 0 { // Keep no-data pixels black even when the model map has edge responses.
+					a = 0
+				}
+			} else {
+				c := inferno(chMap[i])
+				or, og, ob = float64(c.R), float64(c.G), float64(c.B)
+			}
 		}
 		if drMap != nil && drMap[i] >= cfg.thresh && drMap[i] > 0 {
 			or, og, ob, a = 0, 210, 255, 0.75*math.Min(1.0, drMap[i]*2.0)

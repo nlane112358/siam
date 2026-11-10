@@ -25,7 +25,7 @@ GO_TARGETS = bin/asf bin/sarimg
 all: $(TARGET) $(GO_TARGETS)
 
 SOURCES = main.cpp
-HEADERS = config.hpp image.hpp network.hpp trainer.hpp detector.hpp spectral.hpp temporal.hpp dataset.hpp
+HEADERS = config.hpp image.hpp network.hpp trainer.hpp detector.hpp dataset.hpp
 
 $(TARGET): $(SOURCES) $(HEADERS) | bin
 	$(CXX) $(CXXFLAGS) $< -o $@ $(LDFLAGS)

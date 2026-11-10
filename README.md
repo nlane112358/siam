@@ -209,7 +209,7 @@ The displayed PNG masks zero-valued tile centers outside the valid data footprin
 
 ## SAR examples
 
-These exploratory panels show full-scene Sentinel-1 inputs and model distance maps, plus training and held-out chips. The full-scene pass uses stride 16; change maps are contrast-stretched for display.
+The change PNGs keep the POST SAR backscatter as a grayscale background and brighten detected changes in white. When the source TIFFs are available, inference also writes a `${TAG}_full_scene_change.png` over the full swath; its rotated footprint and black no-data wedges follow the SAR scene. The matching `${TAG}_full_scene_pca.png` shows embedding variation at the same extent.
 
 ![Sentinel-1 SAR example](docs/sar-full-scene.png)
 

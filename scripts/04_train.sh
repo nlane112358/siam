@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 04_train.sh — Train Siamese Barlow Twins encoder and evaluate ROC-AUC
+# 04_train.sh — Train Siamese contrastive encoder and evaluate ROC-AUC
 set -euo pipefail
 source "$(dirname "$0")/config.sh"
 
@@ -11,11 +11,11 @@ fi
 TRAIN_FLAGS=(-t -w "$WEIGHTS" -n "$STEPS" -l "$LR" -L "$PAIRS_FILE")
 [[ -f "$WEIGHTS" ]] && TRAIN_FLAGS+=(-c)
 
-echo "==> Training Siamese encoder ($STEPS steps, lr=$LR)..."
+echo "==> Training Siamese contrastive encoder ($STEPS steps, lr=$LR)..."
 siam "${TRAIN_FLAGS[@]}"
 
 NUM_PAIRS="$(grep -cve '^\s*$' "$PAIRS_FILE" || true)"
 if [[ "$NUM_PAIRS" -ge 2 ]]; then
     echo "==> Evaluating matched vs. mismatched pairs..."
-    siam -e -w "$WEIGHTS" -s "$STRIDE" -L "$PAIRS_FILE"
+    siam -e -w "$WEIGHTS" -s "$STRIDE" -a "$TILE_THRESH" -f "$ALERT_FRAC" -L "$PAIRS_FILE"
 fi
